@@ -55,8 +55,10 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/test/helpers.sh"
 
-check "help prints usage" sh -c '"$1" help' sh "$ROOT/mirror.sh" | grep -q 'audit'
-assert_eq "help mentions setup" 0 $?
+out=$("$ROOT/mirror.sh" help 2>&1)
+assert_contains "help lists audit" "audit" "$out"
+assert_contains "help lists setup" "setup" "$out"
+assert_contains "help lists sync" "sync" "$out"
 
 out=$("$ROOT/mirror.sh" bogus 2>&1); rc=$?
 assert_eq "unknown command rc" 2 "$rc"
@@ -65,13 +67,12 @@ assert_contains "unknown command msg" "unknown command" "$out"
 "$ROOT/mirror.sh" >/dev/null 2>&1
 assert_eq "no args exits 2" 2 $?
 
-MIRROR_NO_MAIN=1 sh -c '. "$1"; [ "$(map_github_name Foo)" = "Foo" ]' sh "$ROOT/mirror.sh"
-assert_eq "sourcing does not run main" 0 $?
+# sourcing must not run main (MIRROR_NO_MAIN guard)
+out=$(MIRROR_NO_MAIN=1 sh -c '. "$1"; map_github_name Foo' sh "$ROOT/mirror.sh")
+assert_eq "sourcing does not run main" "Foo" "$out"
 
 report
 ```
-
-Replace the two `check`-style lines with simple assertions if `check` is unnecessary; see Step 3 for `helpers.sh`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
