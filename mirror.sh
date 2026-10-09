@@ -195,20 +195,18 @@ mirror_list() {
   '
 }
 
-# mirror_match <project_id> <gh_name>: print "<status><TAB><count>" for the push
-# mirrors targeting @github.com/$GH_USER/<gh_name>.git, or return non-zero when
-# the API could not be queried. The target is matched literally with awk index()
-# (repo names may contain sed/glob metacharacters like . + [ *), never with a
-# regex, case-insensitively (GitLab MyApp may mirror to GitHub myapp), and is
-# anchored on "@github.com/" so a lookalike host such as "@mygithub.com" cannot
-# match. When several mirrors match, the healthiest status wins:
-# ok > error > disabled.
-mirror_match() {
+# mirror_match_in <mirror_lines> <gh_name>: same "<status><TAB><count>"
+# computation as mirror_match, but over already-fetched mirror_list output.
+# Callers that must distinguish "no matching mirror" from "the query failed"
+# fetch once with mirror_list and use this, so there is no second (possibly
+# inconsistent) query. The target is matched literally with awk index() (repo
+# names may contain sed/glob metacharacters like . + [ *), never with a regex,
+# case-insensitively (GitLab MyApp may mirror to GitHub myapp), and is anchored
+# on "@github.com/" so a lookalike host such as "@mygithub.com" cannot match.
+# When several mirrors match, the healthiest status wins: ok > error > disabled.
+mirror_match_in() {
   target="@github.com/$GH_USER/$2.git"
-  if ! mirrors=$(mirror_list "$1"); then
-    return 1
-  fi
-  printf '%s\n' "$mirrors" | awk -F'\t' -v t="$target" '
+  printf '%s\n' "$1" | awk -F'\t' -v t="$target" '
     BEGIN { t = tolower(t); best = 0; n = 0 }
     index(tolower($2), t) {
       n++
@@ -225,6 +223,16 @@ mirror_match() {
       printf "%s\t%d\n", s, n
     }
   '
+}
+
+# mirror_match <project_id> <gh_name>: print "<status><TAB><count>" for the push
+# mirrors targeting @github.com/$GH_USER/<gh_name>.git, or return non-zero when
+# the API could not be queried.
+mirror_match() {
+  if ! mirrors=$(mirror_list "$1"); then
+    return 1
+  fi
+  mirror_match_in "$mirrors" "$2"
 }
 
 # mirror_status <project_id> <gh_name>: print ok|disabled|error|missing for the
@@ -424,24 +432,33 @@ EOF
 }
 
 # ensure_push_mirror <project_id> <gh_name>: make the GitLab push mirror to the
-# GitHub repo healthy and correctly configured. A healthy mirror (`ok`) is left
-# alone; a disabled/errored one is updated in place (id looked up from
-# mirror_list) so re-runs never create duplicates; otherwise one is created.
+# GitHub repo healthy and correctly configured. The mirror list is fetched exactly
+# once so "query failed" and "no matching mirror" are distinguishable:
+#   query failed (mirror_list non-zero) → never POST (a POST could duplicate an
+#     unknown mirror); warn and return non-zero so the run fails.
+#   ok                                  → no-op.
+#   target present (disabled/error)     → PUT in place, reusing its id.
+#   target confirmed absent             → POST a new mirror.
 ensure_push_mirror() {
   pid=$1
   gh_name=$2
   body=$(mirror_body_file "$gh_name") || return 1
-  st=$(mirror_status "$pid" "$gh_name")
+  if ! mirrors=$(mirror_list "$pid"); then
+    warn "could not query mirrors for project $pid; refusing to guess, no mirror change"
+    return 1
+  fi
+  st=$(mirror_match_in "$mirrors" "$gh_name")
+  st=${st%%"$(printf '\t')"*}
   if [ "$st" = "ok" ]; then
     return 0
   fi
-  if [ "$st" = "disabled" ] || [ "$st" = "error" ]; then
-    mid=$(mirror_list "$pid" | awk -F'\t' -v t="@github.com/$GH_USER/$gh_name.git" 'index($2, t) { print $1; exit }')
-    if [ -n "$mid" ]; then
-      run glab api -X PUT "projects/$pid/remote_mirrors/$mid" --input "$body"
-      return $?
-    fi
+  # Case-insensitive, literal match (mirror_match_in lowercases its target).
+  mid=$(printf '%s\n' "$mirrors" | awk -F'\t' -v t="@github.com/$GH_USER/$gh_name.git" 'index(tolower($2), tolower(t)) { print $1; exit }')
+  if [ -n "$mid" ]; then
+    run glab api -X PUT "projects/$pid/remote_mirrors/$mid" --input "$body"
+    return $?
   fi
+  # The query succeeded and no target matched: safe to create.
   run glab api -X POST "projects/$pid/remote_mirrors" --input "$body"
 }
 
@@ -488,6 +505,7 @@ apply_setup() {
   command -v gh >/dev/null 2>&1 || die "gh CLI not found"
   gh api user >/dev/null 2>&1 || die "GitHub authentication failed; run 'gh auth login'"
 
+  apply_rc=0
   while IFS=' ' read -r action a b; do
     [ -n "$action" ] || continue
     case "$action" in
@@ -496,21 +514,23 @@ apply_setup() {
           info "already exists, skipping: $a"
           continue
         fi
-        create_github_repo "$a" "$b" ;;
+        create_github_repo "$a" "$b" || apply_rc=1 ;;
       configure-mirror)
-        ensure_push_mirror "$b" "$(map_github_name "$a")" ;;
+        ensure_push_mirror "$b" "$(map_github_name "$a")" || apply_rc=1 ;;
       create-gitlab)
         if listing_has "$WORK_DIR/setup.gl.tsv" "$a"; then
           info "already exists, skipping: $a"
           continue
         fi
-        create_gitlab_project "$a" "$b" ;;
+        create_gitlab_project "$a" "$b" || apply_rc=1 ;;
       seed-gitlab)
-        seed_gitlab_from_github "$a" ;;
+        seed_gitlab_from_github "$a" || apply_rc=1 ;;
       *)
-        warn "unknown setup action: $action" ;;
+        warn "unknown setup action: $action"
+        apply_rc=1 ;;
     esac
   done < "$plan_file"
+  return "$apply_rc"
 }
 
 # cmd_setup: print the plan and, under --dry-run, stop without mutating.

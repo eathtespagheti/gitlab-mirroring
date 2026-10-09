@@ -102,4 +102,20 @@ case "$(cat "$FAKE_CALLS_LOG")" in
   *"remote_mirrors --input"*) assert_eq "no duplicate mirror created" "no POST" "POST" ;;
 esac
 
+# A failed mirror query must never POST: with the query failing we cannot know
+# whether a mirror exists, so a POST could duplicate one. The failure is recorded
+# and the run exits non-zero; unrelated actions may still proceed.
+export FAKE_GLAB_PROJECTS="$tmp/gl.tsv" FAKE_GH_REPOS="$tmp/gh.tsv" FAKE_GLAB_API_OUT="$tmp/mir.ndjson"
+: > "$FAKE_CALLS_LOG"; : > "$FAKE_BODY_LOG"
+export FAKE_GLAB_API_FAIL=1
+out=$(sh "$ROOT/mirror.sh" setup --yes 2>&1); rc=$?
+unset FAKE_GLAB_API_FAIL
+assert_contains "failed query is recorded" "could not query mirrors for project 12" "$out"
+case "$rc" in
+  0) assert_eq "failed query exits nonzero" "nonzero" "0" ;;
+  *) : ;;
+esac
+assert_not_contains "no POST after failed query" "-X POST" "$(cat "$FAKE_CALLS_LOG")"
+assert_not_contains "no PUT after failed query" "-X PUT" "$(cat "$FAKE_CALLS_LOG")"
+
 report
