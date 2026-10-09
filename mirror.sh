@@ -4,6 +4,19 @@ LC_ALL=C
 export LC_ALL
 : "${MIRROR_NO_MAIN:=0}"
 
+# Global option state. Defaults are declared here so the Task 1 interface
+# contract holds; Task 2's parse_args overwrites them with parsed values.
+: "${CMD:=}"
+: "${DRY_RUN:=0}"
+: "${ASSUME_YES:=0}"
+: "${FORCE_ALIGN:=0}"
+: "${CONFLICT:=lab}"
+: "${JSON_OUT:=0}"
+: "${EXIT_CODE:=0}"
+: "${VERBOSE:=0}"
+: "${ONLY_LIST:=}"
+: "${EXCLUDE_LIST:=}"
+
 die()  { printf 'mirror: error: %s\n' "$1" >&2; exit 1; }
 warn() { printf 'mirror: warning: %s\n' "$1" >&2; }
 info() { printf '%s\n' "$1"; }
