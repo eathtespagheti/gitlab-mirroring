@@ -16,6 +16,9 @@ export LC_ALL
 : "${VERBOSE:=0}"
 : "${ONLY_LIST:=}"
 : "${EXCLUDE_LIST:=}"
+# Set once acquire_lock has claimed the per-cache sync lock, so release_lock
+# never removes a lock this run did not create.
+: "${LOCK_HELD:=0}"
 
 die()  { printf 'mirror: error: %s\n' "$1" >&2; exit 1; }
 warn() { printf 'mirror: warning: %s\n' "$1" >&2; }
@@ -125,6 +128,10 @@ parse_args() {
     esac
     shift
   done
+  case "$CONFLICT" in
+    lab | report) : ;;
+    *) die "invalid --conflict: $CONFLICT" ;;
+  esac
 }
 
 # resolve_config: fill GH_USER, GL_USER, GH_TOKEN, CACHE_DIR, the URL bases and
@@ -575,12 +582,85 @@ cache_ensure() {
 # is what cmd_sync reads after every repo.
 mark_sync_failed() { printf '%s\n' "$1" >> "$WORK_DIR/sync_failed"; }
 
-# handle_conflict <name> <branch>: the real GitLab-wins/report conflict policy
-# belongs to a later task. For now this stub only reports and changes nothing,
-# so a divergent branch is neither lost nor force-updated here.
+# handle_conflict <name> <branch>: apply the sync conflict policy to a branch
+# that truly diverged (neither side is an ancestor of the other). GitLab is
+# canonical. `report` warns and changes nothing; `lab` (the default) force-
+# updates only that specific GitHub ref from the cached GitLab ref; any other
+# value is a configuration error. Never deletes and never uses --mirror.
 handle_conflict() {
-  warn "conflict on $1/$2 (deferred)"
-  return 0
+  case "$CONFLICT" in
+    report) warn "conflict on $1/$2 (GitLab kept; GitHub not changed)"; return 0 ;;
+    lab)
+      warn "conflict on $1/$2: GitLab wins; force-updating GitHub"
+      run "$GIT" -C "$(cache_repo_dir "$1")" push --force github \
+        "refs/remotes/gitlab/$2:refs/heads/$2"
+      ;;
+    *) die "invalid --conflict: $CONFLICT" ;;
+  esac
+}
+
+# force_align <name>: one-time GitLab -> GitHub force alignment for the refs of a
+# repo that diverged (driven by --force-align). It force-updates ONLY the
+# specific GitHub branches/tags that differ from GitLab; it never deletes a ref
+# and never uses --mirror. Ref existence is established from the cache, which
+# sync_repo has already fetched.
+force_align() {
+  _fa_name=$1
+  _fa_d=$(cache_repo_dir "$_fa_name")
+  [ -d "$_fa_d" ] || return 0
+  _fa_rc=0
+
+  _fa_branches=$WORK_DIR/fa.branches
+  if ! "$GIT" -C "$_fa_d" for-each-ref --format='%(refname)' refs/remotes/github/ > "$_fa_branches"; then
+    warn "could not enumerate GitHub branches for $_fa_name"
+    return 1
+  fi
+  while IFS= read -r _fa_ref; do
+    [ -n "$_fa_ref" ] || continue
+    _fa_b=${_fa_ref#refs/remotes/github/}
+    [ "$_fa_b" = "HEAD" ] && continue
+    _fa_gl="refs/remotes/gitlab/$_fa_b"
+    "$GIT" -C "$_fa_d" rev-parse --verify -q "$_fa_gl" >/dev/null || continue
+    if "$GIT" -C "$_fa_d" merge-base --is-ancestor "$_fa_gl" "$_fa_ref"; then
+      continue
+    fi
+    warn "force-align $_fa_name/$_fa_b: GitLab wins; force-updating GitHub"
+    run "$GIT" -C "$_fa_d" push --force github "$_fa_gl:refs/heads/$_fa_b" || _fa_rc=1
+  done < "$_fa_branches"
+
+  _fa_tags=$WORK_DIR/fa.tags
+  if ! "$GIT" -C "$_fa_d" for-each-ref --format='%(refname)' refs/gh-tags/ > "$_fa_tags"; then
+    warn "could not enumerate GitHub tags for $_fa_name"
+    return 1
+  fi
+  while IFS= read -r _fa_ref; do
+    [ -n "$_fa_ref" ] || continue
+    _fa_t=${_fa_ref#refs/gh-tags/}
+    _fa_gl="refs/gl-tags/$_fa_t"
+    "$GIT" -C "$_fa_d" rev-parse --verify -q "$_fa_gl" >/dev/null || continue
+    _fa_glsha=$("$GIT" -C "$_fa_d" rev-parse "$_fa_gl")
+    _fa_ghsha=$("$GIT" -C "$_fa_d" rev-parse "$_fa_ref")
+    [ "$_fa_glsha" = "$_fa_ghsha" ] && continue
+    warn "force-align $_fa_name/$_fa_t: GitLab wins; force-updating GitHub tag"
+    run "$GIT" -C "$_fa_d" push --force github "$_fa_gl:refs/tags/$_fa_t" || _fa_rc=1
+  done < "$_fa_tags"
+
+  return "$_fa_rc"
+}
+
+# acquire_lock: atomically claim the per-cache sync lock with mkdir. A lock left
+# behind by a crashed/other run makes this fail loudly rather than racing it.
+acquire_lock() {
+  mkdir "$CACHE_DIR/.sync.lock" 2>/dev/null || die "sync already running (lock: $CACHE_DIR/.sync.lock)"
+  LOCK_HELD=1
+}
+
+# release_lock: idempotent cleanup registered in the EXIT/HUP/INT/TERM trap. Only
+# removes the lock when this run actually acquired it, so a foreign lock survives.
+release_lock() {
+  [ "$LOCK_HELD" = "1" ] || return 0
+  rmdir "$CACHE_DIR/.sync.lock" 2>/dev/null || :
+  LOCK_HELD=0
 }
 
 # selected <name>: true when a managed repo passes --only/--exclude. Matching is
@@ -671,7 +751,14 @@ sync_repo() {
       _sr_gl=$("$GIT" -C "$_sr_d" rev-parse "refs/gl-tags/$_sr_t")
       _sr_gh=$("$GIT" -C "$_sr_d" rev-parse "$_sr_ref")
       if [ "$_sr_gl" != "$_sr_gh" ]; then
-        warn "tag conflict on $_sr_name/$_sr_t (deferred)"
+        case "$CONFLICT" in
+          report) warn "tag conflict on $_sr_name/$_sr_t (GitLab kept; GitHub not changed)" ;;
+          lab)
+            warn "tag conflict on $_sr_name/$_sr_t: GitLab wins; force-updating GitHub"
+            run "$GIT" -C "$_sr_d" push --force github "refs/gl-tags/$_sr_t:refs/tags/$_sr_t" ||
+              mark_sync_failed "$_sr_name" ;;
+          *) die "invalid --conflict: $CONFLICT" ;;
+        esac
       fi
     fi
   done < "$_sr_tags"
@@ -686,6 +773,7 @@ sync_repo() {
 # rescue each from GitHub. Returns non-zero if any repo failed to sync.
 cmd_sync() {
   [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
+  acquire_lock
   mkdir -p "$WORK_DIR" || die "cannot create work dir"
   : > "$WORK_DIR/sync_failed"
   _cs_list=$WORK_DIR/sync.gl.tsv
@@ -695,6 +783,9 @@ cmd_sync() {
     [ -n "$_cs_name" ] || continue
     selected "$_cs_name" || continue
     sync_repo "$_cs_name" || _cs_rc=1
+    if [ "$FORCE_ALIGN" = "1" ]; then
+      force_align "$_cs_name" || _cs_rc=1
+    fi
   done < "$_cs_list"
   if [ -s "$WORK_DIR/sync_failed" ]; then
     _cs_rc=1
@@ -708,7 +799,7 @@ main() {
     audit | setup | sync)
       resolve_config
       WORK_DIR=$(mktemp -d) || die "cannot create temp dir"
-      trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
+      trap 'release_lock; rm -rf "$WORK_DIR"' EXIT HUP INT TERM
       ;;
   esac
   case "$CMD" in

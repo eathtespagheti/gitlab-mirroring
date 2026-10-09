@@ -101,4 +101,71 @@ out=$(sh "$ROOT/mirror.sh" sync --yes --only missing 2>&1); rc=$?
 assert_eq "unreachable GitLab exits non-zero" 1 "$rc"
 assert_contains "failure names the repo" "missing" "$out"
 
+# --- conflict policy: report vs lab (GitLab wins) ---------------------------
+# Build a true divergence in a fresh pair of bare repos: a common commit, then
+# GitLab gets commit L and GitHub gets commit G from that same base.
+w2=$(mktemp -d)
+mkdir -p "$w2/github/u" "$w2/gitlab/u"
+"$GIT_BIN" -c init.defaultBranch=main init --bare -q "$w2/github/u/proj.git" >/dev/null
+"$GIT_BIN" -c init.defaultBranch=main init --bare -q "$w2/gitlab/u/proj.git" >/dev/null
+
+s=$(mktemp -d)
+"$GIT_BIN" -C "$s" -c init.defaultBranch=main init -q
+"$GIT_BIN" -C "$s" -c user.email=a@b -c user.name=a commit -q --allow-empty -m base
+"$GIT_BIN" -C "$s" push -q "$w2/github/u/proj.git" main
+"$GIT_BIN" -C "$s" push -q "$w2/gitlab/u/proj.git" main
+# GitLab side: commit L.
+"$GIT_BIN" -C "$s" -c user.email=a@b -c user.name=a commit -q --allow-empty -m L
+"$GIT_BIN" -C "$s" push -q "$w2/gitlab/u/proj.git" main
+L=$(rev "$w2/gitlab/u/proj.git" main)
+# GitHub side: commit G from the common base.
+"$GIT_BIN" -C "$s" -c user.email=a@b -c user.name=a reset -q --hard HEAD~1
+"$GIT_BIN" -C "$s" -c user.email=a@b -c user.name=a commit -q --allow-empty -m G
+"$GIT_BIN" -C "$s" push -q --force "$w2/github/u/proj.git" main
+G=$(rev "$w2/github/u/proj.git" main)
+
+export MIRROR_GITHUB_URL_BASE="file://$w2/github" MIRROR_GITLAB_URL_BASE="file://$w2/gitlab"
+export MIRROR_CACHE="$w2/cache"
+export FAKE_GLAB_PROJECTS="$w2/gl.tsv" FAKE_GLAB_API_OUT="$w2/mir.ndjson"
+printf 'proj\t1\tprivate\tmain\n' > "$w2/gl.tsv"
+printf '{"id":9,"enabled":true,"url":"https://*****:*****@github.com/u/proj.git","last_error":null}\n' > "$w2/mir.ndjson"
+
+# --conflict=report: warn and change neither side.
+out=$(sh "$ROOT/mirror.sh" sync --yes --only proj --conflict=report 2>&1); rc=$?
+assert_eq "report rc" 0 "$rc"
+assert_eq "report leaves gitlab alone" "$L" "$(rev "$w2/gitlab/u/proj.git" main)"
+assert_eq "report leaves github alone" "$G" "$(rev "$w2/github/u/proj.git" main)"
+
+# Default (lab): GitLab is canonical, GitHub is force-updated to L.
+out=$(sh "$ROOT/mirror.sh" sync --yes --only proj 2>&1); rc=$?
+assert_eq "lab rc" 0 "$rc"
+assert_contains "gitlab wins on conflict" "conflict" "$out"
+assert_eq "github forced to gitlab" "$L" "$(rev "$w2/github/u/proj.git" main)"
+
+# --force-align forces GitLab -> GitHub even under --conflict=report.
+"$GIT_BIN" -C "$w2/github/u/proj.git" update-ref refs/heads/main "$G"
+out=$(sh "$ROOT/mirror.sh" sync --yes --only proj --conflict=report --force-align 2>&1); rc=$?
+assert_eq "force-align rc" 0 "$rc"
+assert_contains "force-align announced" "force-align" "$out"
+assert_eq "force-align github to gitlab" "$L" "$(rev "$w2/github/u/proj.git" main)"
+
+# A same-named tag that diverges follows the same policy (GitLab wins).
+"$GIT_BIN" -C "$w2/gitlab/u/proj.git" tag -f t1 "$L" >/dev/null 2>&1
+"$GIT_BIN" -C "$w2/github/u/proj.git" tag -f t1 "$G" >/dev/null 2>&1
+out=$(sh "$ROOT/mirror.sh" sync --yes --only proj 2>&1); rc=$?
+assert_eq "tag conflict rc" 0 "$rc"
+assert_contains "tag conflict gitlab wins" "tag conflict" "$out"
+assert_eq "github tag forced to gitlab" "$L" "$(rev "$w2/github/u/proj.git" t1)"
+
+# --- lock: a pre-existing lock makes sync refuse and is left intact ----------
+rm -rf "$MIRROR_CACHE"
+mkdir -p "$MIRROR_CACHE/.sync.lock"
+out=$(sh "$ROOT/mirror.sh" sync --yes 2>&1); rc=$?
+assert_eq "locked rc" 1 "$rc"
+assert_contains "locked msg" "already running" "$out"
+assert_eq "foreign lock preserved" 0 "$( [ -d "$MIRROR_CACHE/.sync.lock" ]; echo $? )"
+rmdir "$MIRROR_CACHE/.sync.lock"
+
+rm -rf "$w2" "$s"
+
 report
