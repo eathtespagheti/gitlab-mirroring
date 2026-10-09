@@ -370,25 +370,167 @@ plan_setup() {
   done < "$pgh_file"
 }
 
-# cmd_setup: print the plan and, under --dry-run, stop without mutating. Apply
-# is Task 6; until then a non-dry run fails loudly rather than silently doing
-# nothing.
-cmd_setup() {
+# run <cmd...>: print the command to stderr with any embedded credentials
+# masked, then execute it unless DRY_RUN=1. Secrets are never passed on the
+# argument list (the push-mirror body travels in a file via --input), so nothing
+# sensitive is printed here.
+run() {
+  printf '+ %s\n' "$(printf '%s ' "$@" | sed 's#://[^/@]*@#://***@#g')" >&2
+  [ "$DRY_RUN" = "1" ] && return 0
+  "$@"
+}
+
+# create_github_repo <name> <visibility>
+create_github_repo() {
+  case "$2" in
+    public) v=--public ;;
+    *) v=--private ;;
+  esac
+  run gh repo create "$GH_USER/$1" "$v"
+}
+
+# create_gitlab_project <name> <visibility>
+create_gitlab_project() {
+  case "$2" in
+    public) v=--public ;;
+    private) v=--private ;;
+    internal) v=--internal ;;
+    *) v=--private ;;
+  esac
+  run glab repo create "$1" "$v" --skipGitInit
+}
+
+# seed_gitlab_from_github <name>: clone the GitHub repo bare, then push every ref
+# to the freshly created GitLab project. Both calls go through run, so they obey
+# DRY_RUN and are observable via $GIT in tests.
+seed_gitlab_from_github() {
+  d="$WORK_DIR/$1.git"
+  seed_url="$GITHUB_URL_BASE/$GH_USER/$1.git"
+  dest_url="$GITLAB_URL_BASE/$GL_USER/$1.git"
+  run "$GIT" clone --bare --quiet "$seed_url" "$d"
+  run "$GIT" -C "$d" push --mirror "$dest_url"
+}
+
+# mirror_body_file <gh_name>: write the push-mirror JSON body to a 0600 file and
+# print its path. The GitHub token is embedded in the url, so the body is kept in
+# a file handed to `glab api --input`; it is never an argument and never printed.
+mirror_body_file() {
+  f="$WORK_DIR/mirror-body-$1.json"
+  ( umask 077; : > "$f" )
+  cat > "$f" <<EOF
+{"url":"https://$GH_USER:$GH_TOKEN@github.com/$GH_USER/$1.git","enabled":true,"auth_method":"password","only_protected_branches":false,"keep_divergent_refs":true}
+EOF
+  printf '%s\n' "$f"
+}
+
+# ensure_push_mirror <project_id> <gh_name>: make the GitLab push mirror to the
+# GitHub repo healthy and correctly configured. A healthy mirror (`ok`) is left
+# alone; a disabled/errored one is updated in place (id looked up from
+# mirror_list) so re-runs never create duplicates; otherwise one is created.
+ensure_push_mirror() {
+  pid=$1
+  gh_name=$2
+  body=$(mirror_body_file "$gh_name") || return 1
+  st=$(mirror_status "$pid" "$gh_name")
+  if [ "$st" = "ok" ]; then
+    return 0
+  fi
+  if [ "$st" = "disabled" ] || [ "$st" = "error" ]; then
+    mid=$(mirror_list "$pid" | awk -F'\t' -v t="@github.com/$GH_USER/$gh_name.git" 'index($2, t) { print $1; exit }')
+    if [ -n "$mid" ]; then
+      run glab api -X PUT "projects/$pid/remote_mirrors/$mid" --input "$body"
+      return $?
+    fi
+  fi
+  run glab api -X POST "projects/$pid/remote_mirrors" --input "$body"
+}
+
+# confirm_or_abort: proceed when ASSUME_YES=1; otherwise prompt only on a
+# terminal. With no terminal (pipes, CI) it dies rather than hanging.
+confirm_or_abort() {
+  if [ "$ASSUME_YES" = "1" ]; then
+    return 0
+  fi
+  if [ -t 0 ]; then
+    printf 'Apply these changes? [y/N] ' >&2
+    read -r reply || reply=
+    case "$reply" in
+      y | Y | yes | YES) return 0 ;;
+      *) die "aborted" ;;
+    esac
+  fi
+  die "refusing to apply without --yes (stdin is not a terminal)"
+}
+
+# listing_has <file> <name>: true when the lowercased first column of a listing
+# file (written by plan_setup) matches name. Literal, never regex.
+listing_has() {
+  [ -s "$1" ] || return 1
+  awk -F'\t' -v k="$(repo_key "$2")" 'tolower($1) == k { found = 1 } END { exit found ? 0 : 1 }' "$1"
+}
+
+# apply_setup: compute the plan, confirm, then execute each action. Each action
+# is re-checked against the listings captured by plan_setup, so an already-present
+# repo is skipped, and mirror work is delegated to ensure_push_mirror, which is
+# itself idempotent (re-runs are safe).
+apply_setup() {
   [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
-  # plan_setup runs in a command-substitution subshell; propagate its failure
-  # instead of continuing as if the plan were merely empty (error masking).
-  plan=$(plan_setup) || exit 1
+  plan_file=$WORK_DIR/setup.plan
+  plan_setup > "$plan_file" || die "failed to compute setup plan"
   info "setup plan:"
-  if [ -n "$plan" ]; then
-    printf '%s\n' "$plan"
+  if [ -s "$plan_file" ]; then
+    cat "$plan_file"
   else
     info "nothing to do"
+    return 0
   fi
+  confirm_or_abort
+  command -v gh >/dev/null 2>&1 || die "gh CLI not found"
+  gh api user >/dev/null 2>&1 || die "GitHub authentication failed; run 'gh auth login'"
+
+  while IFS=' ' read -r action a b; do
+    [ -n "$action" ] || continue
+    case "$action" in
+      create-github)
+        if listing_has "$WORK_DIR/setup.gh.tsv" "$a"; then
+          info "already exists, skipping: $a"
+          continue
+        fi
+        create_github_repo "$a" "$b" ;;
+      configure-mirror)
+        ensure_push_mirror "$b" "$(map_github_name "$a")" ;;
+      create-gitlab)
+        if listing_has "$WORK_DIR/setup.gl.tsv" "$a"; then
+          info "already exists, skipping: $a"
+          continue
+        fi
+        create_gitlab_project "$a" "$b" ;;
+      seed-gitlab)
+        seed_gitlab_from_github "$a" ;;
+      *)
+        warn "unknown setup action: $action" ;;
+    esac
+  done < "$plan_file"
+}
+
+# cmd_setup: print the plan and, under --dry-run, stop without mutating.
+# Otherwise apply it (create repos, seed, configure push mirrors).
+cmd_setup() {
+  [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
   if [ "$DRY_RUN" = "1" ]; then
+    # plan_setup runs in a command-substitution subshell; propagate its failure
+    # instead of continuing as if the plan were merely empty (error masking).
+    plan=$(plan_setup) || exit 1
+    info "setup plan:"
+    if [ -n "$plan" ]; then
+      printf '%s\n' "$plan"
+    else
+      info "nothing to do"
+    fi
     info "dry run; no changes"
     return 0
   fi
-  die "setup apply not implemented"
+  apply_setup
 }
 
 cmd_sync()  { die "sync not implemented"; }

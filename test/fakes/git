@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake `git` for the test suite: record every invocation's arguments in
+# ${FAKE_GIT_LOG:-/dev/null} and succeed. Tests point GIT at this file so
+# seeding clones/pushes are observed without touching a network. Never used
+# outside test/.
+: "${FAKE_GIT_LOG:=/dev/null}"
+printf 'git %s\n' "$*" >> "$FAKE_GIT_LOG"
+exit 0

@@ -13,12 +13,25 @@ case "$1 $2" in
   "repo list") cat "${FAKE_GLAB_PROJECTS:-/dev/null}" ;;
   "repo create") printf 'https://gitlab.com/%s\n' "$3" ;;
   "api "*)
-    # Generic API call (endpoint in $2, flags in $3+). GETs dump
-    # ${FAKE_GLAB_API_OUT}, the Task 4 remote_mirrors fixture. Mutations
-    # (--input / -X|--method PUT|POST|DELETE) return ${FAKE_GLAB_API_RESPONSE}
-    # when set; Task 6 extends the mutation handling.
+    # Generic API call (endpoint in $2, flags in $3+). A request carrying a JSON
+    # body via --input records that body in ${FAKE_BODY_LOG} (never printed to
+    # stdout) and answers with an empty object; the push-mirror POST/PUT uses
+    # this. Other mutations return ${FAKE_GLAB_API_RESPONSE} when set. GETs dump
+    # ${FAKE_GLAB_API_OUT}, the Task 4 remote_mirrors fixture.
     case " $* " in
-      *" --input "* | *" -X PUT "* | *" -X POST "* | *" -X DELETE "* | \
+      *" --input "*)
+        prev=
+        for arg in "$@"; do
+          if [ "$prev" = "--input" ]; then
+            if [ -n "${FAKE_BODY_LOG:-}" ]; then
+              cat "$arg" >> "$FAKE_BODY_LOG"
+            fi
+            break
+          fi
+          prev=$arg
+        done
+        printf '{}\n' ;;
+      *" -X PUT "* | *" -X POST "* | *" -X DELETE "* | \
       *" --method PUT "* | *" --method POST "* | *" --method DELETE "*)
         if [ -n "${FAKE_GLAB_API_RESPONSE:-}" ]; then
           cat "$FAKE_GLAB_API_RESPONSE"
