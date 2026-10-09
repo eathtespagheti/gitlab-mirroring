@@ -1,0 +1,11 @@
+[Unit]
+Description=GitHub -> GitLab mirror safety-net sync
+Documentation=file:/usr/local/bin/mirror.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mirror.sh sync --yes
+# Optional: point at a file exporting GITHUB_TOKEN / MIRROR_* overrides.
+# EnvironmentFile=-%h/.config/gitlab-github-mirror/env
