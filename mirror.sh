@@ -375,7 +375,9 @@ plan_setup() {
 # nothing.
 cmd_setup() {
   [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
-  plan=$(plan_setup)
+  # plan_setup runs in a command-substitution subshell; propagate its failure
+  # instead of continuing as if the plan were merely empty (error masking).
+  plan=$(plan_setup) || exit 1
   info "setup plan:"
   if [ -n "$plan" ]; then
     printf '%s\n' "$plan"

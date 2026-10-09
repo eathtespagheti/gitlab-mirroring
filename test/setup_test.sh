@@ -40,4 +40,14 @@ assert_eq "empty-only plan rc" 0 "$rc"
 assert_contains "empty-only create-github" "create-github Empty private" "$out"
 assert_contains "empty-only configure-mirror" "configure-mirror Empty 12" "$out"
 
+# A failing listing must fail the command loudly, never silently plan nothing.
+FAKE_GLAB_PROJECTS=/nonexistent
+export FAKE_GLAB_PROJECTS
+out=$(sh "$ROOT/mirror.sh" setup --dry-run 2>&1); rc=$?
+assert_contains "failing listing reports error" "failed to list GitLab projects" "$out"
+case "$rc" in
+  0) assert_eq "failing listing exits nonzero" "nonzero" "0" ;;
+  *) : ;;
+esac
+
 report
