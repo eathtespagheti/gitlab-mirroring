@@ -624,26 +624,27 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/test/helpers.sh"
 
-printf 'Alpha\t11\tpublic\tmain\nEmpty\t12\tprivate\t\n' > "$ROOT/test/fixtures/gl_projects2.tsv"
-printf 'Gamma\tpublic\n' > "$ROOT/test/fixtures/gh_repos2.tsv"
-printf '{"id":101,"enabled":true,"url":"https://*****:*****@github.com/u/Alpha.git","last_error":null}\n' > "$ROOT/test/fixtures/mirrors_alpha.ndjson"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+# Alpha exists on BOTH hosts with a healthy mirror (exercises mirror_status);
+# Empty is GitLab-only (empty repo); Gamma is GitHub-only.
+printf 'Alpha\t11\tpublic\tmain\nEmpty\t12\tprivate\t\n' > "$tmp/gl.tsv"
+printf 'Alpha\tpublic\nGamma\tpublic\n' > "$tmp/gh.tsv"
+printf '{"id":101,"enabled":true,"url":"https://*****:*****@github.com/u/Alpha.git","last_error":null}\n' > "$tmp/mir.ndjson"
 
-export FAKE_GH_REPOS="$ROOT/test/fixtures/gh_repos2.tsv"
-export MIRROR_GITHUB_USER=u MIRROR_GITLAB_USER=u GITHUB_TOKEN=x
+export MIRROR_GITHUB_USER=u MIRROR_GITLAB_USER=u GITHUB_TOKEN=x MIRROR_CACHE="$tmp/cache"
 export PATH="$ROOT/test/fakes:$PATH"
-: > "$ROOT/test/fixtures/calls.log"; export FAKE_CALLS_LOG="$ROOT/test/fixtures/calls.log"
-
-# GitLab projects: use a "scenario" script for glab repo list returning gl_projects2 + mirror lookup
-FAKE_GLAB_PROJECTS="$ROOT/test/fixtures/gl_projects2.tsv"; export FAKE_GLAB_PROJECTS
-FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_alpha.ndjson"; export FAKE_GLAB_API_OUT
+: > "$tmp/calls.log"; export FAKE_CALLS_LOG="$tmp/calls.log"
+export FAKE_GLAB_PROJECTS="$tmp/gl.tsv" FAKE_GH_REPOS="$tmp/gh.tsv" FAKE_GLAB_API_OUT="$tmp/mir.ndjson"
 
 out=$(sh "$ROOT/mirror.sh" setup --dry-run 2>&1)
 # Plan lines are space-separated (repo names contain no spaces).
-assert_contains "GitLab-only Gamma is created" "create-gitlab Gamma private" "$out"
-assert_contains "Gamma is seeded" "seed-gitlab Gamma" "$out"
-assert_contains "Empty gets a mirror configured" "configure-mirror Empty 12" "$out"
-assert_contains "empty repo handled" "Empty" "$out"
-# Alpha already has a healthy mirror -> no configure line for it
+assert_contains "GitLab-only Empty created on GitHub" "create-github Empty private" "$out"
+assert_contains "Empty gets a mirror configured"      "configure-mirror Empty 12" "$out"
+assert_contains "empty repo handled"                  "Empty" "$out"
+assert_contains "GitHub-only Gamma created on GitLab" "create-gitlab Gamma public" "$out"
+assert_contains "Gamma is seeded"                     "seed-gitlab Gamma" "$out"
+# Alpha exists on both with a healthy mirror -> no configure line for it
 case "$out" in *"configure-mirror Alpha"*) assert_eq "Alpha mirror untouched" "absent" "present" ;; esac
 # dry-run must not mutate
 calls=$(cat "$FAKE_CALLS_LOG")
