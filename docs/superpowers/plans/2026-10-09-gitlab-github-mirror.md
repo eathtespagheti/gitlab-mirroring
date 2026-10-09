@@ -708,14 +708,14 @@ git commit -m "feat: setup plan generation (dry-run) with empty-repo handling"
 
 ```sh
 # apply
-export GIT="$ROOT/test/fakes/git"
-: > "$FAKE_CALLS_LOG"; : > "$ROOT/test/fixtures/git.log"; : > "$ROOT/test/fixtures/body.log"
+export GIT="$ROOT/test/fakes/git" FAKE_GIT_LOG="$tmp/git.log" FAKE_BODY_LOG="$tmp/body.log"
+: > "$FAKE_CALLS_LOG"; : > "$FAKE_GIT_LOG"; : > "$FAKE_BODY_LOG"
 sh "$ROOT/mirror.sh" setup --yes >/dev/null 2>&1
 calls=$(cat "$FAKE_CALLS_LOG")
 assert_contains "created GitLab project Gamma" "glab repo create Gamma" "$calls"
-assert_contains "seeded from github" "clone" "$(cat "$ROOT/test/fixtures/git.log")"
+assert_contains "seeded from github" "clone" "$(cat "$FAKE_GIT_LOG")"
 assert_contains "configured mirror Empty" "glab api -X POST projects/12/remote_mirrors" "$calls"
-body=$(cat "$ROOT/test/fixtures/body.log")
+body=$(cat "$FAKE_BODY_LOG")
 assert_contains "mirror url" "github.com/u/Empty.git" "$body"
 assert_contains "keep divergent" '"keep_divergent_refs":true' "$body"
 assert_contains "enabled" '"enabled":true' "$body"
