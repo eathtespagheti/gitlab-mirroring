@@ -144,6 +144,7 @@ failure that prevented an intended action makes the run exit non-zero.
 | Cache dir | `$MIRROR_CACHE`, else `${XDG_CACHE_HOME:-$HOME/.cache}/gitlab-github-mirror` |
 | Name/visibility overrides | `$MIRROR_MAP` file (optional) |
 | Hosts | `$MIRROR_GITHUB_HOST` (default `github.com`), `$MIRROR_GITLAB_HOST` |
+| URL bases (test/self-hosted hook) | `$MIRROR_GITHUB_URL_BASE` (default `https://$MIRROR_GITHUB_HOST`), `$MIRROR_GITLAB_URL_BASE` |
 
 Secrets are never echoed. The GitHub token appears only inside the mirror URL
 sent to GitLab (which stores it encrypted and scrubs it from API responses).
