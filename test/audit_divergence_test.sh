@@ -65,4 +65,26 @@ assert_contains "json divergent list" '"divergent":["proj"]' "$json"
 sh "$ROOT/mirror.sh" audit --exit-code >/dev/null 2>&1
 assert_eq "exit-code on divergence" 1 "$?"
 
+# --- MIRROR_MAP: divergence detection must fetch the mapped GitHub name ------
+# GlMap has no same-named GitHub repo; only GhMap exists. A true divergence can
+# only be proven when the mapping is applied.
+init_bare "$work/github/u/GhMap.git"
+init_bare "$work/gitlab/u/GlMap.git"
+"$GIT_BIN" -C "$seed" -c user.email=a@b -c user.name=a commit -q --allow-empty -m base3
+"$GIT_BIN" -C "$seed" push -q "$work/github/u/GhMap.git" main
+"$GIT_BIN" -C "$seed" push -q "$work/gitlab/u/GlMap.git" main
+"$GIT_BIN" -C "$seed" -c user.email=a@b -c user.name=a commit -q --allow-empty -m L3
+"$GIT_BIN" -C "$seed" push -q "$work/gitlab/u/GlMap.git" main
+"$GIT_BIN" -C "$seed" -c user.email=a@b -c user.name=a reset -q --hard HEAD~1
+"$GIT_BIN" -C "$seed" -c user.email=a@b -c user.name=a commit -q --allow-empty -m G3
+"$GIT_BIN" -C "$seed" push -q --force "$work/github/u/GhMap.git" main
+
+printf 'GlMap\t3\tprivate\tmain\n' >> "$work/gl.tsv"
+printf 'GlMap\tprivate\n' >> "$work/gh.tsv"
+printf 'GlMap GhMap\n' > "$work/map"
+export MIRROR_MAP="$work/map"
+out=$(sh "$ROOT/mirror.sh" audit 2>&1)
+assert_contains "mapped divergence reported" "divergent: GlMap" "$out"
+unset MIRROR_MAP
+
 report

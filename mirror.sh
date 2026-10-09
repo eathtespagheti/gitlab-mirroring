@@ -257,9 +257,26 @@ mirror_status() {
 
 # list_gitlab_projects: one line per project in the user namespace:
 #   gl_name<TAB>project_id<TAB>visibility<TAB>default_branch
+# Pages are read one at a time (100 per page) until a page returns fewer than
+# 100 entries, so accounts with more than one page are fully enumerated. Each
+# page's output is buffered and reprinted once; no line is duplicated or
+# prefixed by the loop. A failed listing call returns non-zero so callers can
+# tell "listing failed" apart from "no projects".
 list_gitlab_projects() {
-  glab repo list --mine --per-page 100 --output json \
-    --jq '.[] | select(.namespace.kind == "user") | [.path, (.id|tostring), .visibility, (.default_branch // "")] | @tsv'
+  _lgp_page=1
+  while :; do
+    if ! _lgp_out=$(glab repo list --mine --per-page 100 --page "$_lgp_page" --output json \
+        --jq '.[] | select(.namespace.kind == "user") | [.path, (.id|tostring), .visibility, (.default_branch // "")] | @tsv'); then
+      return 1
+    fi
+    if [ -n "$_lgp_out" ]; then
+      printf '%s\n' "$_lgp_out"
+    fi
+    _lgp_count=$(printf '%s\n' "$_lgp_out" | grep -c .)
+    [ "$_lgp_count" -ge 100 ] || break
+    _lgp_page=$((_lgp_page + 1))
+  done
+  return 0
 }
 
 # list_github_repos: one line per repo: gh_name<TAB>lowercased-visibility
@@ -298,15 +315,17 @@ audit_print() {
   done < "$1"
 }
 
-# audit_divergent <name>: return 0 when the cached GitHub and GitLab branch
-# heads for <name> truly diverge (neither side is an ancestor of the other).
-# Read-only with respect to remotes: it may populate the local cache and fetch
-# into it, but never pushes. Any failure to establish the facts returns 1, so the
-# caller never reports a repo it could not prove divergent.
+# audit_divergent <name> <gh_name>: return 0 when the cached GitHub and GitLab
+# branch heads for <name> truly diverge (neither side is an ancestor of the
+# other). <gh_name> is the mapped GitHub repository name (MIRROR_MAP). Read-only
+# with respect to remotes: it may populate the local cache and fetch into it, but
+# never pushes. Any failure to establish the facts returns 1, so the caller never
+# reports a repo it could not prove divergent.
 audit_divergent() {
   _av_name=$1
+  _av_gh=$2
   _av_d=$(cache_repo_dir "$_av_name")
-  cache_ensure "$_av_name" || return 1
+  cache_ensure "$_av_name" "$_av_gh" || return 1
   "$GIT" -C "$_av_d" fetch --prune --quiet github \
     '+refs/heads/*:refs/remotes/github/*' >/dev/null 2>&1 || return 1
   "$GIT" -C "$_av_d" fetch --prune --quiet gitlab \
@@ -434,7 +453,7 @@ cmd_audit() {
     fi
 
     # True divergence: neither branch head is an ancestor of the other.
-    if audit_divergent "$name"; then
+    if audit_divergent "$name" "$gh_name"; then
       printf '%s\n' "$name" >> "$f_div"
     fi
   done < "$gl_file"
@@ -583,10 +602,19 @@ create_gitlab_project() {
 # refspecs are used instead of `--mirror` so seeding can only create/update refs
 # and can never delete them. Both calls go through run, so they obey DRY_RUN and
 # are observable via $GIT in tests.
+#
+# Defence in depth: seeding is only ever legitimate into an empty project. If the
+# GitLab project already advertises any ref, refuse to seed (a push here would
+# overwrite canonical GitLab history) and return success, since the repository
+# already exists and is not a seeding target.
 seed_gitlab_from_github() {
+  dest_url="$GITLAB_URL_BASE/$GL_USER/$1.git"
+  if "$GIT" ls-remote "$dest_url" 2>/dev/null | grep -q .; then
+    warn "refusing to seed $1: GitLab project already has refs"
+    return 0
+  fi
   d="$WORK_DIR/$1.git"
   seed_url="$GITHUB_URL_BASE/$GH_USER/$1.git"
-  dest_url="$GITLAB_URL_BASE/$GL_USER/$1.git"
   run "$GIT" clone --bare --quiet "$seed_url" "$d"
   run "$GIT" -C "$d" push --force "$dest_url" \
     "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
@@ -679,6 +707,8 @@ apply_setup() {
   gh api user >/dev/null 2>&1 || die "GitHub authentication failed; run 'gh auth login'"
 
   apply_rc=0
+  created_gl=$WORK_DIR/setup.created
+  : > "$created_gl"
   while IFS=' ' read -r action a b; do
     [ -n "$action" ] || continue
     case "$action" in
@@ -695,8 +725,19 @@ apply_setup() {
           info "already exists, skipping: $a"
           continue
         fi
-        create_gitlab_project "$a" "$b" || apply_rc=1 ;;
+        if create_gitlab_project "$a" "$b"; then
+          printf '%s\n' "$a" >> "$created_gl"
+        else
+          apply_rc=1
+        fi ;;
       seed-gitlab)
+        # Seeding is only valid for a project created by this run. If the
+        # project already existed (create was skipped) or its creation failed,
+        # do not seed: a forced push would clobber canonical GitLab history.
+        if ! grep -qxF -- "$a" "$created_gl"; then
+          info "skipping seed for $a: GitLab project was not created in this run"
+          continue
+        fi
         seed_gitlab_from_github "$a" || apply_rc=1 ;;
       *)
         warn "unknown setup action: $action"
@@ -729,16 +770,26 @@ cmd_setup() {
 # cache_repo_dir <name>: the bare cache repository backing `sync` for a repo.
 cache_repo_dir() { printf '%s\n' "$CACHE_DIR/$1.git"; }
 
-# cache_ensure <name>: create the bare cache and its github/gitlab remotes when
-# absent. Idempotent. Remote URLs are built from the configured URL bases and
-# resolved users; git authentication is inherited from the environment (the tool
-# never stores or echoes a GitLab token).
+# cache_ensure <gl_name> <gh_name>: create the bare cache and its github/gitlab
+# remotes when absent. The GitHub remote uses the mapped GitHub name (<gh_name>,
+# from MIRROR_MAP) while the GitLab remote uses <gl_name>; the cache directory is
+# keyed on the GitLab name. The GitHub URL is refreshed on every call so a cache
+# built before a mapping existed does not keep fetching the wrong repository.
+# Idempotent. Remote URLs are built from the configured URL bases and resolved
+# users; git authentication is inherited from the environment (the tool never
+# stores or echoes a GitLab token).
 cache_ensure() {
-  _ce_d=$(cache_repo_dir "$1")
+  _ce_gl=$1
+  _ce_gh=${2:-$1}
+  _ce_d=$(cache_repo_dir "$_ce_gl")
   if [ ! -d "$_ce_d" ]; then
     "$GIT" init --bare -q "$_ce_d" || return 1
-    "$GIT" -C "$_ce_d" remote add github "$GITHUB_URL_BASE/$GH_USER/$1.git" || return 1
-    "$GIT" -C "$_ce_d" remote add gitlab "$GITLAB_URL_BASE/$GL_USER/$1.git" || return 1
+    "$GIT" -C "$_ce_d" remote add github "$GITHUB_URL_BASE/$GH_USER/$_ce_gh.git" || return 1
+    "$GIT" -C "$_ce_d" remote add gitlab "$GITLAB_URL_BASE/$GL_USER/$_ce_gl.git" || return 1
+  else
+    if ! "$GIT" -C "$_ce_d" remote set-url github "$GITHUB_URL_BASE/$GH_USER/$_ce_gh.git" 2>/dev/null; then
+      "$GIT" -C "$_ce_d" remote add github "$GITHUB_URL_BASE/$GH_USER/$_ce_gh.git" || return 1
+    fi
   fi
   return 0
 }
@@ -851,8 +902,9 @@ selected() {
 # policy. Failures are recorded in $WORK_DIR/sync_failed and returned non-zero.
 sync_repo() {
   _sr_name=$1
+  _sr_gh=$(map_github_name "$_sr_name")
   _sr_d=$(cache_repo_dir "$_sr_name")
-  if ! cache_ensure "$_sr_name"; then
+  if ! cache_ensure "$_sr_name" "$_sr_gh"; then
     warn "could not prepare cache for $_sr_name"
     mark_sync_failed "$_sr_name"
     return 1
@@ -892,6 +944,11 @@ sync_repo() {
         warn "could not fast-forward $_sr_name/$_sr_b on GitLab"
         mark_sync_failed "$_sr_name"
       fi
+    elif "$GIT" -C "$_sr_d" merge-base --is-ancestor "$_sr_ref" "refs/remotes/gitlab/$_sr_b"; then
+      # GitLab is ahead (GitHub is an ancestor of GitLab). This is the normal
+      # state between push-mirror updates: there is nothing to rescue and no
+      # conflict, so do not warn and do not force-push. Simply leave it.
+      :
     else
       handle_conflict "$_sr_name" "$_sr_b" || mark_sync_failed "$_sr_name"
     fi

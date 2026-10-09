@@ -10,7 +10,25 @@ case "$1 $2" in
     else
       printf '%s\n' '{"username":"tester"}'
     fi ;;
-  "repo list") cat "${FAKE_GLAB_PROJECTS:-/dev/null}" ;;
+  "repo list")
+    # Emulate glab's pagination: honor --page/--per-page (defaults 1/100) and
+    # serve the corresponding slice of the fixture. An unreadable fixture fails
+    # like the real CLI, so "listing failed" stays distinguishable from "empty".
+    page=1; per=100; prev=
+    for arg in "$@"; do
+      case "$arg" in
+        --page=*) page=${arg#--page=} ;;
+        --per-page=*) per=${arg#--per-page=} ;;
+      esac
+      [ "$prev" = "--page" ] && page=$arg
+      [ "$prev" = "--per-page" ] && per=$arg
+      prev=$arg
+    done
+    f=${FAKE_GLAB_PROJECTS:-/dev/null}
+    [ -r "$f" ] || { cat "$f"; exit 1; }
+    start=$(( (page - 1) * per + 1 ))
+    end=$(( page * per ))
+    sed -n "${start},${end}p" "$f" ;;
   "repo create") printf 'https://gitlab.com/%s\n' "$3" ;;
   "api "*)
     # Generic API call (endpoint in $2, flags in $3+). A request carrying a JSON
