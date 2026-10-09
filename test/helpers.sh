@@ -20,6 +20,15 @@ assert_contains() { # desc needle haystack
   esac
 }
 
+assert_not_contains() { # desc needle haystack
+  TESTS_RUN=$((TESTS_RUN + 1))
+  case "$3" in
+    *"$2"*) TESTS_FAILED=$((TESTS_FAILED + 1))
+            printf 'FAIL: %s\n  unexpected: [%s]\n  in:         [%s]\n' "$1" "$2" "$3" >&2 ;;
+    *) : ;;
+  esac
+}
+
 source_mirror() { # ROOT
   MIRROR_NO_MAIN=1
   export MIRROR_NO_MAIN

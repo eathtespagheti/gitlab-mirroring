@@ -168,14 +168,68 @@ resolve_config() {
   GIT=${GIT:-git}
 }
 
-cmd_audit() { die "audit not implemented"; }
+# repo_key <name>: lowercase key used for case-insensitive host matching.
+repo_key() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# list_gitlab_projects: one line per project in the user namespace:
+#   gl_name<TAB>project_id<TAB>visibility<TAB>default_branch
+list_gitlab_projects() {
+  glab repo list --mine --per-page 100 --output json \
+    --jq '.[] | select(.namespace.kind == "user") | [.path, (.id|tostring), .visibility, (.default_branch // "")] | @tsv'
+}
+
+# list_github_repos: one line per repo: gh_name<TAB>lowercased-visibility
+list_github_repos() {
+  gh repo list "$GH_USER" --limit 1000 --json name,visibility \
+    --jq '.[] | [.name, (.visibility|ascii_downcase)] | @tsv'
+}
+
+# cmd_audit: enumerate both hosts and print the drift buckets. Read-only.
+# Matching is case-insensitive and literal (never regex).
+cmd_audit() {
+  [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
+  mkdir -p "$WORK_DIR" || die "cannot create work dir"
+  gl_file=$WORK_DIR/gl.tsv
+  gh_file=$WORK_DIR/gh.tsv
+  gl_keys=$WORK_DIR/gl.keys
+  gh_keys=$WORK_DIR/gh.keys
+
+  list_gitlab_projects > "$gl_file" || die "failed to list GitLab projects"
+  list_github_repos > "$gh_file" || die "failed to list GitHub repositories"
+
+  # Lowercased key sets for case-insensitive membership tests. awk tolower keeps
+  # this literal; no regex is involved.
+  awk -F'\t' 'NF { print tolower($1) }' "$gl_file" > "$gl_keys"
+  awk -F'\t' 'NF { print tolower($1) }' "$gh_file" > "$gh_keys"
+
+  while IFS="$(printf '\t')" read -r name _ _ _; do
+    [ -n "$name" ] || continue
+    key=$(repo_key "$name")
+    if ! grep -qxF -- "$key" "$gh_keys"; then
+      info "GitLab only: $name"
+    fi
+  done < "$gl_file"
+
+  while IFS="$(printf '\t')" read -r name _; do
+    [ -n "$name" ] || continue
+    key=$(repo_key "$name")
+    if ! grep -qxF -- "$key" "$gl_keys"; then
+      info "GitHub only: $name"
+    fi
+  done < "$gh_file"
+}
+
 cmd_setup() { die "setup not implemented"; }
 cmd_sync()  { die "sync not implemented"; }
 
 main() {
   parse_args "$@"
   case "$CMD" in
-    audit | setup | sync) resolve_config ;;
+    audit | setup | sync)
+      resolve_config
+      WORK_DIR=$(mktemp -d) || die "cannot create temp dir"
+      trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
+      ;;
   esac
   case "$CMD" in
     help) usage ;;
