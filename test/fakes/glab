@@ -11,7 +11,7 @@ case "$1 $2" in
       printf '%s\n' '{"username":"tester"}'
     fi ;;
   "repo list") cat "${FAKE_GLAB_PROJECTS:-/dev/null}" ;;
-  "repo create") printf 'https://gitlab.com/%s\n' "$2" ;;
+  "repo create") printf 'https://gitlab.com/%s\n' "$3" ;;
   "api "*)
     # Generic GET (endpoint in $2); Task 4 handles remote_mirrors specially.
     cat "${FAKE_GLAB_API_OUT:-/dev/null}" ;;

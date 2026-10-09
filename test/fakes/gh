@@ -12,6 +12,6 @@ case "$1 $2" in
   "repo view")
     if [ -n "${FAKE_GH_EXISTING:-}" ] && grep -qxF "$3" "$FAKE_GH_EXISTING"; then exit 0; fi
     printf 'not found\n' >&2; exit 1 ;;
-  "repo create") printf 'https://github.com/%s\n' "$2" ;;
+  "repo create") printf 'https://github.com/%s\n' "$3" ;;
   *) printf 'fake-gh: unhandled: %s\n' "$*" >&2; exit 1 ;;
 esac
