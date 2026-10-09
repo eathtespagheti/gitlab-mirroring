@@ -23,7 +23,11 @@ case "$1 $2" in
         if [ -n "${FAKE_GLAB_API_RESPONSE:-}" ]; then
           cat "$FAKE_GLAB_API_RESPONSE"
         fi ;;
-      *) cat "${FAKE_GLAB_API_OUT:-/dev/null}" ;;
+      *) if [ "${FAKE_GLAB_API_FAIL:-0}" = "1" ]; then
+           printf 'fake-glab: api failure\n' >&2
+           exit 1
+         fi
+         cat "${FAKE_GLAB_API_OUT:-/dev/null}" ;;
     esac ;;
   *) printf 'fake-glab: unhandled: %s\n' "$*" >&2; exit 1 ;;
 esac

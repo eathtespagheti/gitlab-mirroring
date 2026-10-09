@@ -175,44 +175,67 @@ repo_key() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 # GitLab project as id<TAB>url<TAB>enabled<TAB>last_error. GitLab returns
 # compact NDJSON; fields are extracted with awk (no jq, POSIX only). The
 # credentials in url are scrubbed by GitLab to https://*****:*****@host/..., so
-# only the host/path fragment is ever used. Missing fields stay empty.
+# only the host/path fragment is ever used. Missing fields stay empty. Returns
+# non-zero (after a warning) when the API call itself fails, so callers can tell
+# "no mirrors" apart from "could not ask".
 mirror_list() {
-  glab api "projects/$1/remote_mirrors" --output ndjson 2>/dev/null |
-    awk '
-      {
-        id = ""; url = ""; en = ""; err = ""
-        if (match($0, /"id":[0-9]+/))                 id  = substr($0, RSTART + 5,  RLENGTH - 5)
-        if (match($0, /"url":"[^"]*"/))               url = substr($0, RSTART + 7,  RLENGTH - 8)
-        if (match($0, /"enabled":(true|false)/))      en  = substr($0, RSTART + 10, RLENGTH - 10)
-        if (match($0, /"last_error":("[^"]*"|null)/)) err = substr($0, RSTART + 13, RLENGTH - 13)
-        if (id != "") printf "%s\t%s\t%s\t%s\n", id, url, en, err
-      }
-    '
+  if ! api_out=$(glab api "projects/$1/remote_mirrors" --output ndjson 2>/dev/null); then
+    warn "could not query mirrors for project $1"
+    return 1
+  fi
+  printf '%s\n' "$api_out" | awk '
+    {
+      id = ""; url = ""; en = ""; err = ""
+      if (match($0, /"id":[0-9]+/))                 id  = substr($0, RSTART + 5,  RLENGTH - 5)
+      if (match($0, /"url":"[^"]*"/))               url = substr($0, RSTART + 7,  RLENGTH - 8)
+      if (match($0, /"enabled":(true|false)/))      en  = substr($0, RSTART + 10, RLENGTH - 10)
+      if (match($0, /"last_error":("[^"]*"|null)/)) err = substr($0, RSTART + 13, RLENGTH - 13)
+      if (id != "") printf "%s\t%s\t%s\t%s\n", id, url, en, err
+    }
+  '
 }
 
-# mirror_status <project_id> <gh_name>: print ok|disabled|error|missing for the
-# push mirror that targets github.com/$GH_USER/<gh_name>.git. The target is
-# matched literally with awk index() (repo names may contain sed/glob
-# metacharacters like . + [ *), never with a regex, and case-insensitively
-# (GitLab project MyApp may mirror to GitHub myapp). When several mirrors match,
-# the healthiest wins: ok > error > disabled.
-mirror_status() {
-  target="github.com/$GH_USER/$2.git"
-  mirror_list "$1" | awk -F'\t' -v t="$target" '
-    BEGIN { t = tolower(t); best = 0 }
+# mirror_match <project_id> <gh_name>: print "<status><TAB><count>" for the push
+# mirrors targeting @github.com/$GH_USER/<gh_name>.git, or return non-zero when
+# the API could not be queried. The target is matched literally with awk index()
+# (repo names may contain sed/glob metacharacters like . + [ *), never with a
+# regex, case-insensitively (GitLab MyApp may mirror to GitHub myapp), and is
+# anchored on "@github.com/" so a lookalike host such as "@mygithub.com" cannot
+# match. When several mirrors match, the healthiest status wins:
+# ok > error > disabled.
+mirror_match() {
+  target="@github.com/$GH_USER/$2.git"
+  if ! mirrors=$(mirror_list "$1"); then
+    return 1
+  fi
+  printf '%s\n' "$mirrors" | awk -F'\t' -v t="$target" '
+    BEGIN { t = tolower(t); best = 0; n = 0 }
     index(tolower($2), t) {
+      n++
       if ($3 == "true" && ($4 == "null" || $4 == "")) r = 3
       else if ($4 != "null" && $4 != "") r = 2
       else r = 1
       if (r > best) best = r
     }
     END {
-      if (best == 3) print "ok"
-      else if (best == 2) print "error"
-      else if (best == 1) print "disabled"
-      else print "missing"
+      if (best == 3) s = "ok"
+      else if (best == 2) s = "error"
+      else if (best == 1) s = "disabled"
+      else s = "missing"
+      printf "%s\t%d\n", s, n
     }
   '
+}
+
+# mirror_status <project_id> <gh_name>: print ok|disabled|error|missing for the
+# push mirror that targets @github.com/$GH_USER/<gh_name>.git. An API failure is
+# reported as error, never as missing.
+mirror_status() {
+  if ! match=$(mirror_match "$1" "$2"); then
+    printf 'error\n'
+    return 0
+  fi
+  printf '%s\n' "${match%%"$(printf '\t')"*}"
 }
 
 # list_gitlab_projects: one line per project in the user namespace:
@@ -262,17 +285,29 @@ cmd_audit() {
     fi
   done < "$gh_file"
 
-  # Both-present repos: report push-mirror health. Read-only; one API call per
-  # project. mirror_status matches the target literally and case-insensitively.
+  # Both-present repos: report push-mirror health and pre-existing duplicates.
+  # Read-only; one API call per project. The target match is literal,
+  # case-insensitive, and anchored on "@github.com/"; extra mirrors are reported
+  # (never deleted).
   while IFS="$(printf '\t')" read -r name id _ _; do
     [ -n "$name" ] || continue
     key=$(repo_key "$name")
     grep -qxF -- "$key" "$gh_keys" || continue
-    case "$(mirror_status "$id" "$(map_github_name "$name")")" in
-      missing)  info "no push mirror: $name" ;;
-      disabled) info "push mirror disabled: $name" ;;
-      error)    info "push mirror error: $name" ;;
-    esac
+    if matches=$(mirror_match "$id" "$(map_github_name "$name")"); then
+      status=${matches%%"$(printf '\t')"*}
+      count=${matches#*"$(printf '\t')"}
+      case "$status" in
+        missing)  info "no push mirror: $name" ;;
+        disabled) info "push mirror disabled: $name" ;;
+        error)    info "push mirror error: $name" ;;
+      esac
+      if [ "$count" -gt 1 ]; then
+        info "duplicate push mirrors: $name ($count)"
+      fi
+    else
+      # The API call failed and already warned; never claim there is no mirror.
+      info "push mirror error: $name"
+    fi
   done < "$gl_file"
 }
 

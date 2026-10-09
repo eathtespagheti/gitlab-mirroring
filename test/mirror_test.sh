@@ -55,4 +55,18 @@ assert_eq "case-insensitive match" ok "$(mirror_status 11 'Proj')"
 export FAKE_GLAB_API_OUT="$FIX/mirrors_dupes.ndjson"
 assert_eq "healthy duplicate wins" ok "$(mirror_status 11 proj)"
 
+# A failing GitLab API must surface as error (and warn), never as missing.
+err_log=$(mktemp) || exit 1
+export FAKE_GLAB_API_FAIL=1
+api_status=$(mirror_status 11 proj 2>"$err_log")
+assert_eq "api failure -> error" error "$api_status"
+assert_contains "api failure warns" \
+  "mirror: warning: could not query mirrors for project 11" "$(cat "$err_log")"
+unset FAKE_GLAB_API_FAIL
+rm -f "$err_log"
+
+# The target is anchored on "@github.com/", so a lookalike host cannot match.
+export FAKE_GLAB_API_OUT="$FIX/mirrors_fakehost.ndjson"
+assert_eq "lookalike host does not match" missing "$(mirror_status 11 proj)"
+
 report

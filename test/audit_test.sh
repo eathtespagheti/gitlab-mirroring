@@ -69,6 +69,19 @@ assert_not_contains "healthy dot.name not disabled" "push mirror disabled: dot.n
 assert_not_contains "healthy dot.name not error" "push mirror error: dot.name" "$out"
 assert_not_contains "case-insensitive Beta not missing" "no push mirror: Beta" "$out"
 
+# Pre-existing duplicate mirrors to the same target are reported, not hidden.
+out=$(FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_audit_dupes.ndjson" \
+      sh "$ROOT/mirror.sh" audit --dry-run 2>&1); rc=$?
+assert_eq "audit rc with dup mirrors" 0 "$rc"
+assert_contains "duplicate mirrors reported" "duplicate push mirrors: dot.name (2)" "$out"
+assert_not_contains "unique repo has no dup line" "duplicate push mirrors: Beta" "$out"
+
+# A failing mirror API must not masquerade as "no push mirror".
+out=$(FAKE_GLAB_API_FAIL=1 sh "$ROOT/mirror.sh" audit --dry-run 2>&1); rc=$?
+assert_eq "audit rc with api failure" 0 "$rc"
+assert_contains "api failure reports error" "push mirror error: Beta" "$out"
+assert_not_contains "api failure not missing" "no push mirror: Beta" "$out"
+
 # Direct interface checks: list_* fields and repo_key lowercasing.
 source_mirror "$ROOT"
 GH_USER=u
