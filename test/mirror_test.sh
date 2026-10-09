@@ -69,4 +69,21 @@ rm -f "$err_log"
 export FAKE_GLAB_API_OUT="$FIX/mirrors_fakehost.ndjson"
 assert_eq "lookalike host does not match" missing "$(mirror_status 11 proj)"
 
+# --- Task 10: mirror URL/target must use $GITHUB_HOST ------------------------
+WT=$(mktemp -d) || exit 1
+trap 'rm -rf "$WT"' EXIT
+WORK_DIR=$WT
+GH_TOKEN=token_SENTINEL
+export GITHUB_HOST=github.example.com
+body=$(mirror_body_file proj)
+assert_contains "host-correct mirror url" \
+  "@github.example.com/u/proj.git" "$(cat "$body")"
+assert_not_contains "mirror url not github.com" \
+  "@github.com/u/proj.git" "$(cat "$body")"
+# The target fragment follows the host too: the github.com fixture no longer matches.
+export FAKE_GLAB_API_OUT="$FIX/mirrors_present.ndjson"
+assert_eq "host override changes target" missing "$(mirror_status 11 proj)"
+GITHUB_HOST=github.com
+assert_eq "default host still matches" ok "$(mirror_status 11 proj)"
+
 report

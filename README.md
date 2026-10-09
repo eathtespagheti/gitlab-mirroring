@@ -92,9 +92,22 @@ literal name matching) and prints one line per finding:
   - `push mirror disabled: <name>`
   - `push mirror error: <name>`
   - `duplicate push mirrors: <name> (<count>)`
+- `visibility mismatch: <name> (<gitlab> vs <github>)` — the visibility GitLab
+  would map to (`public`/`private`) differs from what GitHub reports.
+- `divergent: <name>` — a branch exists on both sides but neither history is an
+  ancestor of the other (needs `--force-align` or a manual fix).
+- `empty: <name>` — a both-present repo with no commits (no default branch);
+  reported and skipped.
 
-`audit` never mutates a remote. Extra/duplicate mirrors are reported, never
-deleted.
+`audit` never mutates a remote. To detect divergent histories it reads through
+(and therefore populates) the local cache and only ever fetches. Extra/duplicate
+mirrors are reported, never deleted.
+
+`audit` accepts `--json` (one machine-readable JSON object with a `gitlab_only`,
+`github_only`, `no_mirror`, `mirror_disabled`, `mirror_error`,
+`duplicate_mirrors`, `visibility_mismatch`, `divergent` and `empty` array),
+`--exit-code` (exit non-zero when any bucket is non-empty) and `--verbose`
+(per-bucket counts to stderr).
 
 ### `setup` — create the missing side and configure the push mirror
 
@@ -135,19 +148,21 @@ second concurrent run exits with `sync already running`.
 
 | Option | Applies to | Meaning |
 |--------|-----------|---------|
-| `--dry-run` | `setup`, `sync` | Print the plan / commands and change nothing. For `sync` it echoes the git commands (including fetches) instead of running them. |
+| `--dry-run` | `setup`, `sync` | Print the plan / commands and change nothing. For `sync` it echoes the git commands (including fetches) instead of running them; it still creates the local cache repository and takes the `sync` lock. |
 | `--yes`, `-y` | `setup`, `sync` | Apply without interactive confirmation. |
 | `--only NAME` | `sync` | Restrict to `NAME` (repeatable; case-insensitive, literal). |
 | `--exclude NAME` | `sync` | Skip `NAME` (repeatable; case-insensitive, literal). |
 | `--force-align` | `sync` | One-time force **GitLab → GitHub** for refs of divergent repos. |
 | `--conflict=MODE` | `sync` | Conflict policy: `lab` (default, GitLab wins) or `report` (warn only). |
-| `--json` | `audit` | Accepted; reserved for machine-readable audit output (not emitted in this version). |
-| `--exit-code` | `audit` | Accepted; reserved to make `audit` exit non-zero on drift (not wired in this version). |
-| `--verbose`, `-v` | all | Accepted; reserved for extra stderr diagnostics (currently no additional output). |
+| `--json` | `audit` | Emit one machine-readable JSON object summarising every audit bucket. |
+| `--exit-code` | `audit` | Exit non-zero when any audit bucket is non-empty (default `audit` still exits `0`). |
+| `--verbose`, `-v` | all | Print per-bucket audit counts to stderr (no effect on stdout). |
+| `--help`, `-h` | — | Show usage. |
 
-Exit codes: `0` on success. `audit` reports drift but exits `0`. `setup`/`sync`
-exit non-zero if any intended action failed (per-repo failures are reported and
-do not abort the rest of the run). An unknown command exits `2`.
+Exit codes: `0` on success. `audit` reports drift but exits `0` unless
+`--exit-code` is given, in which case it exits `1` when any bucket is non-empty.
+`setup`/`sync` exit non-zero if any intended action failed (per-repo failures are
+reported and do not abort the rest of the run). An unknown command exits `2`.
 
 ### `--conflict` and `--force-align`
 

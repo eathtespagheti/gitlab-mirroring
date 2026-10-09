@@ -82,6 +82,76 @@ assert_eq "audit rc with api failure" 0 "$rc"
 assert_contains "api failure reports error" "push mirror error: Beta" "$out"
 assert_not_contains "api failure not missing" "no push mirror: Beta" "$out"
 
+# --- Task 10: --exit-code, --json, --verbose, visibility mismatch ------------
+
+# Default audit reports drift but exits 0 (spec: exit codes).
+out=$(sh "$ROOT/mirror.sh" audit >/dev/null 2>&1); rc=$?
+assert_eq "audit without --exit-code still 0" 0 "$rc"
+
+# --exit-code: drift present -> non-zero.
+out=$(sh "$ROOT/mirror.sh" audit --exit-code >/dev/null 2>&1); rc=$?
+assert_eq "exit-code with drift" 1 "$rc"
+
+# --exit-code: a clean pair (same name, same visibility, healthy mirror) -> 0.
+cgl="$TMP/clean.gl.tsv"; cgh="$TMP/clean.gh.tsv"; cmir="$TMP/clean.mir.ndjson"
+printf 'Clean\t31\tprivate\tmain\n' > "$cgl"
+printf 'Clean\tprivate\n' > "$cgh"
+printf '{"id":901,"enabled":true,"url":"https://*****:*****@github.com/u/Clean.git","last_error":null}\n' > "$cmir"
+out=$(FAKE_GLAB_PROJECTS="$cgl" FAKE_GH_REPOS="$cgh" FAKE_GLAB_API_OUT="$cmir" \
+      sh "$ROOT/mirror.sh" audit --exit-code 2>&1); rc=$?
+assert_eq "exit-code clean" 0 "$rc"
+
+# --json: exactly one object on stdout, carrying every bucket key.
+json=$(sh "$ROOT/mirror.sh" audit --json 2>/dev/null)
+assert_eq "json is a single line" 1 "$(printf '%s\n' "$json" | wc -l | tr -d ' ')"
+assert_contains "json has gitlab_only" '"gitlab_only"' "$json"
+assert_contains "json has github_only" '"github_only"' "$json"
+assert_contains "json has no_mirror" '"no_mirror"' "$json"
+assert_contains "json has mirror_disabled" '"mirror_disabled"' "$json"
+assert_contains "json has mirror_error" '"mirror_error"' "$json"
+assert_contains "json has duplicate_mirrors" '"duplicate_mirrors"' "$json"
+assert_contains "json has visibility_mismatch" '"visibility_mismatch"' "$json"
+assert_contains "json has divergent" '"divergent"' "$json"
+assert_contains "json has empty" '"empty"' "$json"
+assert_contains "json gitlab_only values" '"gitlab_only":["Alpha","a.b"]' "$json"
+
+# --json folds duplicate mirrors in as "name (count)".
+json=$(FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_audit_dupes.ndjson" \
+       sh "$ROOT/mirror.sh" audit --json 2>/dev/null)
+assert_contains "json duplicate mirrors" \
+  '"duplicate_mirrors":["dot.name (2)"]' "$json"
+
+# --verbose: per-category counts to stderr, not stdout.
+err=$(FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_audit_dupes.ndjson" \
+      sh "$ROOT/mirror.sh" audit --verbose 2>&1 >/dev/null)
+assert_contains "verbose gitlab_only count" "gitlab_only=2" "$err"
+assert_contains "verbose duplicate count" "duplicate_mirrors=1" "$err"
+stdout_only=$(FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_audit_dupes.ndjson" \
+      sh "$ROOT/mirror.sh" audit --verbose 2>/dev/null)
+assert_not_contains "verbose counts not on stdout" "gitlab_only=2" "$stdout_only"
+
+# Visibility mismatch: GitLab public maps to GitHub public, GitHub says private.
+vgl="$TMP/vis.gl.tsv"; vgh="$TMP/vis.gh.tsv"; vmir="$TMP/vis.mir.ndjson"
+printf 'Vis\t21\tpublic\tmain\n' > "$vgl"
+printf 'Vis\tprivate\n' > "$vgh"
+printf '{"id":900,"enabled":true,"url":"https://*****:*****@github.com/u/Vis.git","last_error":null}\n' > "$vmir"
+out=$(FAKE_GLAB_PROJECTS="$vgl" FAKE_GH_REPOS="$vgh" FAKE_GLAB_API_OUT="$vmir" \
+      sh "$ROOT/mirror.sh" audit --dry-run 2>&1)
+assert_contains "visibility mismatch reported" \
+  "visibility mismatch: Vis (public vs private)" "$out"
+json=$(FAKE_GLAB_PROJECTS="$vgl" FAKE_GH_REPOS="$vgh" FAKE_GLAB_API_OUT="$vmir" \
+       sh "$ROOT/mirror.sh" audit --json 2>/dev/null)
+assert_contains "json visibility mismatch" \
+  '"visibility_mismatch":["Vis (public vs private)"]' "$json"
+
+# An empty GitLab repo present on both hosts is reported under `empty`.
+egl="$TMP/empty.gl.tsv"; egh="$TMP/empty.gh.tsv"
+printf 'Blank\t41\tprivate\t\n' > "$egl"
+printf 'Blank\tprivate\n' > "$egh"
+out=$(FAKE_GLAB_PROJECTS="$egl" FAKE_GH_REPOS="$egh" FAKE_GLAB_API_OUT=/dev/null \
+      sh "$ROOT/mirror.sh" audit --dry-run 2>&1)
+assert_contains "empty repo reported" "empty: Blank" "$out"
+
 # Direct interface checks: list_* fields and repo_key lowercasing.
 source_mirror "$ROOT"
 GH_USER=u

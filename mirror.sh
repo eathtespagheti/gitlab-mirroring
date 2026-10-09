@@ -209,10 +209,12 @@ mirror_list() {
 # inconsistent) query. The target is matched literally with awk index() (repo
 # names may contain sed/glob metacharacters like . + [ *), never with a regex,
 # case-insensitively (GitLab MyApp may mirror to GitHub myapp), and is anchored
-# on "@github.com/" so a lookalike host such as "@mygithub.com" cannot match.
+# on "@$GITHUB_HOST/" so a lookalike host such as "@mygithub.com" cannot match.
 # When several mirrors match, the healthiest status wins: ok > error > disabled.
 mirror_match_in() {
-  target="@github.com/$GH_USER/$2.git"
+  # GITHUB_HOST is always set by resolve_config; the default keeps unit tests
+  # that source the script (and call this directly) working.
+  target="@${GITHUB_HOST:-github.com}/$GH_USER/$2.git"
   printf '%s\n' "$1" | awk -F'\t' -v t="$target" '
     BEGIN { t = tolower(t); best = 0; n = 0 }
     index(tolower($2), t) {
@@ -233,7 +235,7 @@ mirror_match_in() {
 }
 
 # mirror_match <project_id> <gh_name>: print "<status><TAB><count>" for the push
-# mirrors targeting @github.com/$GH_USER/<gh_name>.git, or return non-zero when
+# mirrors targeting @$GITHUB_HOST/$GH_USER/<gh_name>.git, or return non-zero when
 # the API could not be queried.
 mirror_match() {
   if ! mirrors=$(mirror_list "$1"); then
@@ -243,7 +245,7 @@ mirror_match() {
 }
 
 # mirror_status <project_id> <gh_name>: print ok|disabled|error|missing for the
-# push mirror that targets @github.com/$GH_USER/<gh_name>.git. An API failure is
+# push mirror that targets @$GITHUB_HOST/$GH_USER/<gh_name>.git. An API failure is
 # reported as error, never as missing.
 mirror_status() {
   if ! match=$(mirror_match "$1" "$2"); then
@@ -266,8 +268,75 @@ list_github_repos() {
     --jq '.[] | [.name, (.visibility|ascii_downcase)] | @tsv'
 }
 
-# cmd_audit: enumerate both hosts and print the drift buckets. Read-only.
-# Matching is case-insensitive and literal (never regex).
+# audit_json_array <file>: print a JSON array of the newline-separated values in
+# <file>. Repo names match [A-Za-z0-9._-]; a name containing a double quote or a
+# backslash is skipped defensively rather than emitted unescaped.
+audit_json_array() {
+  _aja_first=1
+  printf '['
+  if [ -s "$1" ]; then
+    while IFS= read -r _aja_name; do
+      [ -n "$_aja_name" ] || continue
+      case "$_aja_name" in
+        *'"'*) continue ;;
+        *\\*)  continue ;;
+      esac
+      [ "$_aja_first" = 1 ] || printf ','
+      _aja_first=0
+      printf '"%s"' "$_aja_name"
+    done < "$1"
+  fi
+  printf ']'
+}
+
+# audit_print <file> <prefix>: emit the human-readable lines for one bucket.
+audit_print() {
+  [ -s "$1" ] || return 0
+  while IFS= read -r _ap_line; do
+    [ -n "$_ap_line" ] || continue
+    info "$2$_ap_line"
+  done < "$1"
+}
+
+# audit_divergent <name>: return 0 when the cached GitHub and GitLab branch
+# heads for <name> truly diverge (neither side is an ancestor of the other).
+# Read-only with respect to remotes: it may populate the local cache and fetch
+# into it, but never pushes. Any failure to establish the facts returns 1, so the
+# caller never reports a repo it could not prove divergent.
+audit_divergent() {
+  _av_name=$1
+  _av_d=$(cache_repo_dir "$_av_name")
+  cache_ensure "$_av_name" || return 1
+  "$GIT" -C "$_av_d" fetch --prune --quiet github \
+    '+refs/heads/*:refs/remotes/github/*' >/dev/null 2>&1 || return 1
+  "$GIT" -C "$_av_d" fetch --prune --quiet gitlab \
+    '+refs/heads/*:refs/remotes/gitlab/*' >/dev/null 2>&1 || return 1
+  _av_refs=$WORK_DIR/audit.refs
+  "$GIT" -C "$_av_d" for-each-ref --format='%(refname)' refs/remotes/github/ \
+    > "$_av_refs" 2>/dev/null || return 1
+  while IFS= read -r _av_ref; do
+    [ -n "$_av_ref" ] || continue
+    _av_b=${_av_ref#refs/remotes/github/}
+    [ "$_av_b" = "HEAD" ] && continue
+    _av_gl="refs/remotes/gitlab/$_av_b"
+    "$GIT" -C "$_av_d" rev-parse --verify -q "$_av_gl" >/dev/null 2>&1 || continue
+    if "$GIT" -C "$_av_d" merge-base --is-ancestor "$_av_gl" "$_av_ref"; then
+      continue
+    fi
+    if "$GIT" -C "$_av_d" merge-base --is-ancestor "$_av_ref" "$_av_gl"; then
+      continue
+    fi
+    return 0
+  done < "$_av_refs"
+  return 1
+}
+
+# cmd_audit: enumerate both hosts and write the drift buckets. Read-only with
+# respect to remotes (divergence detection may populate the local cache, but
+# only ever fetches). Matching is case-insensitive and literal (never regex).
+# Findings are collected per category, then rendered as the human report or
+# folded into one JSON object under --json; --exit-code and --verbose consult the
+# same categories.
 cmd_audit() {
   [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
   mkdir -p "$WORK_DIR" || die "cannot create work dir"
@@ -275,6 +344,7 @@ cmd_audit() {
   gh_file=$WORK_DIR/gh.tsv
   gl_keys=$WORK_DIR/gl.keys
   gh_keys=$WORK_DIR/gh.keys
+  gh_vis=$WORK_DIR/gh.vis
 
   list_gitlab_projects > "$gl_file" || die "failed to list GitLab projects"
   list_github_repos > "$gh_file" || die "failed to list GitHub repositories"
@@ -283,12 +353,35 @@ cmd_audit() {
   # this literal; no regex is involved.
   awk -F'\t' 'NF { print tolower($1) }' "$gl_file" > "$gl_keys"
   awk -F'\t' 'NF { print tolower($1) }' "$gh_file" > "$gh_keys"
+  # Lowercased name -> GitHub visibility, for the mismatch bucket.
+  awk -F'\t' 'NF { print tolower($1) "\t" $2 }' "$gh_file" > "$gh_vis"
+
+  # One file per category, values newline-separated. These drive the human
+  # report, --json, --exit-code and --verbose alike.
+  f_gitlab_only=$WORK_DIR/af.gitlab_only
+  f_github_only=$WORK_DIR/af.github_only
+  f_no_mirror=$WORK_DIR/af.no_mirror
+  f_disabled=$WORK_DIR/af.mirror_disabled
+  f_error=$WORK_DIR/af.mirror_error
+  f_dupes=$WORK_DIR/af.duplicate_mirrors
+  f_vis=$WORK_DIR/af.visibility_mismatch
+  f_div=$WORK_DIR/af.divergent
+  f_empty=$WORK_DIR/af.empty
+  : > "$f_gitlab_only"
+  : > "$f_github_only"
+  : > "$f_no_mirror"
+  : > "$f_disabled"
+  : > "$f_error"
+  : > "$f_dupes"
+  : > "$f_vis"
+  : > "$f_div"
+  : > "$f_empty"
 
   while IFS="$(printf '\t')" read -r name _ _ _; do
     [ -n "$name" ] || continue
     key=$(repo_key "$name")
     if ! grep -qxF -- "$key" "$gh_keys"; then
-      info "GitLab only: $name"
+      printf '%s\n' "$name" >> "$f_gitlab_only"
     fi
   done < "$gl_file"
 
@@ -296,34 +389,103 @@ cmd_audit() {
     [ -n "$name" ] || continue
     key=$(repo_key "$name")
     if ! grep -qxF -- "$key" "$gl_keys"; then
-      info "GitHub only: $name"
+      printf '%s\n' "$name" >> "$f_github_only"
     fi
   done < "$gh_file"
 
-  # Both-present repos: report push-mirror health and pre-existing duplicates.
-  # Read-only; one API call per project. The target match is literal,
-  # case-insensitive, and anchored on "@github.com/"; extra mirrors are reported
-  # (never deleted).
-  while IFS="$(printf '\t')" read -r name id _ _; do
+  # Both-present repos: push-mirror health, duplicates, visibility mismatch,
+  # divergence and empty repos. Read-only; one API call per project. The target
+  # match is literal, case-insensitive, and anchored on "@$GITHUB_HOST/".
+  while IFS="$(printf '\t')" read -r name id vis branch; do
     [ -n "$name" ] || continue
     key=$(repo_key "$name")
     grep -qxF -- "$key" "$gh_keys" || continue
-    if matches=$(mirror_match "$id" "$(map_github_name "$name")"); then
+
+    # Empty repos (no commits) are reported and skipped: there is nothing to
+    # mirror or compare yet.
+    if [ -z "$branch" ]; then
+      printf '%s\n' "$name" >> "$f_empty"
+      continue
+    fi
+
+    gh_name=$(map_github_name "$name")
+    if matches=$(mirror_match "$id" "$gh_name"); then
       status=${matches%%"$(printf '\t')"*}
       count=${matches#*"$(printf '\t')"}
       case "$status" in
-        missing)  info "no push mirror: $name" ;;
-        disabled) info "push mirror disabled: $name" ;;
-        error)    info "push mirror error: $name" ;;
+        missing)  printf '%s\n' "$name" >> "$f_no_mirror" ;;
+        disabled) printf '%s\n' "$name" >> "$f_disabled" ;;
+        error)    printf '%s\n' "$name" >> "$f_error" ;;
       esac
       if [ "$count" -gt 1 ]; then
-        info "duplicate push mirrors: $name ($count)"
+        printf '%s (%s)\n' "$name" "$count" >> "$f_dupes"
       fi
     else
       # The API call failed and already warned; never claim there is no mirror.
-      info "push mirror error: $name"
+      printf '%s\n' "$name" >> "$f_error"
+    fi
+
+    # Visibility mismatch: GitLab visibility mapped to the GitHub convention
+    # versus what GitHub actually reports (both lowercased).
+    gh_v=$(awk -F'\t' -v k="$key" '$1 == k { print $2; exit }' "$gh_vis")
+    gl_v=$(gl_to_gh_visibility "$vis")
+    if [ -n "$gh_v" ] && [ "$gl_v" != "$gh_v" ]; then
+      printf '%s (%s vs %s)\n' "$name" "$gl_v" "$gh_v" >> "$f_vis"
+    fi
+
+    # True divergence: neither branch head is an ancestor of the other.
+    if audit_divergent "$name"; then
+      printf '%s\n' "$name" >> "$f_div"
     fi
   done < "$gl_file"
+
+  if [ "$JSON_OUT" = "1" ]; then
+    printf '{"gitlab_only":';        audit_json_array "$f_gitlab_only"
+    printf ',"github_only":';        audit_json_array "$f_github_only"
+    printf ',"no_mirror":';          audit_json_array "$f_no_mirror"
+    printf ',"mirror_disabled":';    audit_json_array "$f_disabled"
+    printf ',"mirror_error":';       audit_json_array "$f_error"
+    printf ',"duplicate_mirrors":';  audit_json_array "$f_dupes"
+    printf ',"visibility_mismatch":'; audit_json_array "$f_vis"
+    printf ',"divergent":';          audit_json_array "$f_div"
+    printf ',"empty":';              audit_json_array "$f_empty"
+    printf '}\n'
+  else
+    audit_print "$f_gitlab_only" "GitLab only: "
+    audit_print "$f_github_only" "GitHub only: "
+    audit_print "$f_no_mirror" "no push mirror: "
+    audit_print "$f_disabled" "push mirror disabled: "
+    audit_print "$f_error" "push mirror error: "
+    audit_print "$f_dupes" "duplicate push mirrors: "
+    audit_print "$f_vis" "visibility mismatch: "
+    audit_print "$f_div" "divergent: "
+    audit_print "$f_empty" "empty: "
+  fi
+
+  if [ "$VERBOSE" = "1" ]; then
+    printf 'audit: gitlab_only=%s github_only=%s no_mirror=%s mirror_disabled=%s mirror_error=%s duplicate_mirrors=%s visibility_mismatch=%s divergent=%s empty=%s\n' \
+      "$(awk 'END { print NR }' "$f_gitlab_only")" \
+      "$(awk 'END { print NR }' "$f_github_only")" \
+      "$(awk 'END { print NR }' "$f_no_mirror")" \
+      "$(awk 'END { print NR }' "$f_disabled")" \
+      "$(awk 'END { print NR }' "$f_error")" \
+      "$(awk 'END { print NR }' "$f_dupes")" \
+      "$(awk 'END { print NR }' "$f_vis")" \
+      "$(awk 'END { print NR }' "$f_div")" \
+      "$(awk 'END { print NR }' "$f_empty")" >&2
+  fi
+
+  # --exit-code: non-zero when any category is non-empty.
+  if [ "$EXIT_CODE" = "1" ]; then
+    for _ac_f in "$f_gitlab_only" "$f_github_only" "$f_no_mirror" \
+                 "$f_disabled" "$f_error" "$f_dupes" "$f_vis" \
+                 "$f_div" "$f_empty"; do
+      if [ -s "$_ac_f" ]; then
+        return 1
+      fi
+    done
+  fi
+  return 0
 }
 
 # plan_setup: print the reconcile plan, one space-separated action per line
@@ -436,7 +598,7 @@ mirror_body_file() {
   f="$WORK_DIR/mirror-body-$1.json"
   ( umask 077; : > "$f" )
   cat > "$f" <<EOF
-{"url":"https://$GH_USER:$GH_TOKEN@github.com/$GH_USER/$1.git","enabled":true,"auth_method":"password","only_protected_branches":false,"keep_divergent_refs":true}
+{"url":"https://$GH_USER:$GH_TOKEN@${GITHUB_HOST:-github.com}/$GH_USER/$1.git","enabled":true,"auth_method":"password","only_protected_branches":false,"keep_divergent_refs":true}
 EOF
   printf '%s\n' "$f"
 }
@@ -463,7 +625,7 @@ ensure_push_mirror() {
     return 0
   fi
   # Case-insensitive, literal match (mirror_match_in lowercases its target).
-  mid=$(printf '%s\n' "$mirrors" | awk -F'\t' -v t="@github.com/$GH_USER/$gh_name.git" 'index(tolower($2), tolower(t)) { print $1; exit }')
+  mid=$(printf '%s\n' "$mirrors" | awk -F'\t' -v t="@${GITHUB_HOST:-github.com}/$GH_USER/$gh_name.git" 'index(tolower($2), tolower(t)) { print $1; exit }')
   if [ -n "$mid" ]; then
     run glab api -X PUT "projects/$pid/remote_mirrors/$mid" --input "$body"
     return $?
