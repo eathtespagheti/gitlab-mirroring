@@ -553,7 +553,154 @@ cmd_setup() {
   apply_setup
 }
 
-cmd_sync()  { die "sync not implemented"; }
+# cache_repo_dir <name>: the bare cache repository backing `sync` for a repo.
+cache_repo_dir() { printf '%s\n' "$CACHE_DIR/$1.git"; }
+
+# cache_ensure <name>: create the bare cache and its github/gitlab remotes when
+# absent. Idempotent. Remote URLs are built from the configured URL bases and
+# resolved users; git authentication is inherited from the environment (the tool
+# never stores or echoes a GitLab token).
+cache_ensure() {
+  _ce_d=$(cache_repo_dir "$1")
+  if [ ! -d "$_ce_d" ]; then
+    "$GIT" init --bare -q "$_ce_d" || return 1
+    "$GIT" -C "$_ce_d" remote add github "$GITHUB_URL_BASE/$GH_USER/$1.git" || return 1
+    "$GIT" -C "$_ce_d" remote add gitlab "$GITLAB_URL_BASE/$GL_USER/$1.git" || return 1
+  fi
+  return 0
+}
+
+# mark_sync_failed <name>: append a repo to the per-run failure log. sync_repo
+# can run ref enumeration in a subshell, so a shared file (not a shell variable)
+# is what cmd_sync reads after every repo.
+mark_sync_failed() { printf '%s\n' "$1" >> "$WORK_DIR/sync_failed"; }
+
+# handle_conflict <name> <branch>: the real GitLab-wins/report conflict policy
+# belongs to a later task. For now this stub only reports and changes nothing,
+# so a divergent branch is neither lost nor force-updated here.
+handle_conflict() {
+  warn "conflict on $1/$2 (deferred)"
+  return 0
+}
+
+# selected <name>: true when a managed repo passes --only/--exclude. Matching is
+# literal and case-insensitive, consistent with the rest of the tool.
+selected() {
+  _sel_key=$(repo_key "$1")
+  if [ -n "$ONLY_LIST" ]; then
+    printf '%s\n' "$ONLY_LIST" | tr '[:upper:]' '[:lower:]' | grep -qxF -- "$_sel_key" || return 1
+  fi
+  if [ -n "$EXCLUDE_LIST" ]; then
+    if printf '%s\n' "$EXCLUDE_LIST" | tr '[:upper:]' '[:lower:]' | grep -qxF -- "$_sel_key"; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# sync_repo <name>: fetch both hosts into the cache and rescue GitHub-side refs
+# onto GitLab. Branch pushes only create or fast-forward (GitLab is an ancestor
+# of GitHub); divergent branches go to the conflict policy. Tags missing on
+# GitLab are pushed; a same-named tag that differs is deferred to the conflict
+# policy. Failures are recorded in $WORK_DIR/sync_failed and returned non-zero.
+sync_repo() {
+  _sr_name=$1
+  _sr_d=$(cache_repo_dir "$_sr_name")
+  if ! cache_ensure "$_sr_name"; then
+    warn "could not prepare cache for $_sr_name"
+    mark_sync_failed "$_sr_name"
+    return 1
+  fi
+  if ! run "$GIT" -C "$_sr_d" fetch --prune --quiet github \
+        '+refs/heads/*:refs/remotes/github/*' '+refs/tags/*:refs/gh-tags/*'; then
+    warn "fetch from GitHub failed for $_sr_name"
+    mark_sync_failed "$_sr_name"
+    return 1
+  fi
+  if ! run "$GIT" -C "$_sr_d" fetch --prune --quiet gitlab \
+        '+refs/heads/*:refs/remotes/gitlab/*' '+refs/tags/*:refs/gl-tags/*'; then
+    warn "fetch from GitLab failed for $_sr_name"
+    mark_sync_failed "$_sr_name"
+    return 1
+  fi
+
+  # Branches: create on GitLab when missing, fast-forward otherwise; anything
+  # else is divergent and handled by the conflict policy.
+  _sr_refs=$WORK_DIR/sync.refs
+  if ! "$GIT" -C "$_sr_d" for-each-ref --format='%(refname)' refs/remotes/github/ > "$_sr_refs"; then
+    warn "could not enumerate GitHub branches for $_sr_name"
+    mark_sync_failed "$_sr_name"
+    return 1
+  fi
+  while IFS= read -r _sr_ref; do
+    [ -n "$_sr_ref" ] || continue
+    _sr_b=${_sr_ref#refs/remotes/github/}
+    [ "$_sr_b" = "HEAD" ] && continue
+    if ! "$GIT" -C "$_sr_d" rev-parse --verify -q "refs/remotes/gitlab/$_sr_b" >/dev/null; then
+      if ! run "$GIT" -C "$_sr_d" push --quiet gitlab "$_sr_ref:refs/heads/$_sr_b"; then
+        warn "could not create $_sr_name/$_sr_b on GitLab"
+        mark_sync_failed "$_sr_name"
+      fi
+    elif "$GIT" -C "$_sr_d" merge-base --is-ancestor "refs/remotes/gitlab/$_sr_b" "$_sr_ref"; then
+      if ! run "$GIT" -C "$_sr_d" push --quiet gitlab "$_sr_ref:refs/heads/$_sr_b"; then
+        warn "could not fast-forward $_sr_name/$_sr_b on GitLab"
+        mark_sync_failed "$_sr_name"
+      fi
+    else
+      handle_conflict "$_sr_name" "$_sr_b" || mark_sync_failed "$_sr_name"
+    fi
+  done < "$_sr_refs"
+
+  # Tags: rescue GitHub tags that GitLab lacks. A same-named tag pointing
+  # elsewhere is divergent; the conflict policy owns that (deferred here).
+  _sr_tags=$WORK_DIR/sync.gh-tags
+  if ! "$GIT" -C "$_sr_d" for-each-ref --format='%(refname)' refs/gh-tags/ > "$_sr_tags"; then
+    warn "could not enumerate GitHub tags for $_sr_name"
+    mark_sync_failed "$_sr_name"
+    return 1
+  fi
+  while IFS= read -r _sr_ref; do
+    [ -n "$_sr_ref" ] || continue
+    _sr_t=${_sr_ref#refs/gh-tags/}
+    if ! "$GIT" -C "$_sr_d" rev-parse --verify -q "refs/gl-tags/$_sr_t" >/dev/null; then
+      if ! run "$GIT" -C "$_sr_d" push --quiet gitlab "$_sr_ref:refs/tags/$_sr_t"; then
+        warn "could not create tag $_sr_name/$_sr_t on GitLab"
+        mark_sync_failed "$_sr_name"
+      fi
+    else
+      _sr_gl=$("$GIT" -C "$_sr_d" rev-parse "refs/gl-tags/$_sr_t")
+      _sr_gh=$("$GIT" -C "$_sr_d" rev-parse "$_sr_ref")
+      if [ "$_sr_gl" != "$_sr_gh" ]; then
+        warn "tag conflict on $_sr_name/$_sr_t (deferred)"
+      fi
+    fi
+  done < "$_sr_tags"
+
+  if grep -qxF -- "$_sr_name" "$WORK_DIR/sync_failed" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+# cmd_sync: iterate managed GitLab projects (filtered by --only/--exclude) and
+# rescue each from GitHub. Returns non-zero if any repo failed to sync.
+cmd_sync() {
+  [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
+  mkdir -p "$WORK_DIR" || die "cannot create work dir"
+  : > "$WORK_DIR/sync_failed"
+  _cs_list=$WORK_DIR/sync.gl.tsv
+  list_gitlab_projects > "$_cs_list" || die "failed to list GitLab projects"
+  _cs_rc=0
+  while IFS="$(printf '\t')" read -r _cs_name _cs_rest; do
+    [ -n "$_cs_name" ] || continue
+    selected "$_cs_name" || continue
+    sync_repo "$_cs_name" || _cs_rc=1
+  done < "$_cs_list"
+  if [ -s "$WORK_DIR/sync_failed" ]; then
+    _cs_rc=1
+  fi
+  return "$_cs_rc"
+}
 
 main() {
   parse_args "$@"
