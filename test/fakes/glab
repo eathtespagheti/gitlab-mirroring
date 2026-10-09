@@ -13,7 +13,17 @@ case "$1 $2" in
   "repo list") cat "${FAKE_GLAB_PROJECTS:-/dev/null}" ;;
   "repo create") printf 'https://gitlab.com/%s\n' "$3" ;;
   "api "*)
-    # Generic GET (endpoint in $2); Task 4 handles remote_mirrors specially.
-    cat "${FAKE_GLAB_API_OUT:-/dev/null}" ;;
+    # Generic API call (endpoint in $2, flags in $3+). GETs dump
+    # ${FAKE_GLAB_API_OUT}, the Task 4 remote_mirrors fixture. Mutations
+    # (--input / -X|--method PUT|POST|DELETE) return ${FAKE_GLAB_API_RESPONSE}
+    # when set; Task 6 extends the mutation handling.
+    case " $* " in
+      *" --input "* | *" -X PUT "* | *" -X POST "* | *" -X DELETE "* | \
+      *" --method PUT "* | *" --method POST "* | *" --method DELETE "*)
+        if [ -n "${FAKE_GLAB_API_RESPONSE:-}" ]; then
+          cat "$FAKE_GLAB_API_RESPONSE"
+        fi ;;
+      *) cat "${FAKE_GLAB_API_OUT:-/dev/null}" ;;
+    esac ;;
   *) printf 'fake-glab: unhandled: %s\n' "$*" >&2; exit 1 ;;
 esac

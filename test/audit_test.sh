@@ -1,5 +1,5 @@
 #!/bin/sh
-# Task 3: audit enumerates and buckets repos case-insensitively.
+# Task 3/4: audit buckets repos case-insensitively and reports push-mirror health.
 set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/test/helpers.sh"
@@ -46,6 +46,28 @@ assert_not_contains "weird+name not github-only" "GitHub only: weird+name" "$out
 assert_not_contains "a.b not github-only (no wildcard)" "GitHub only: a.b" "$out"
 assert_not_contains "Alpha not github-only" "GitHub only: Alpha" "$out"
 assert_not_contains "Gamma not gitlab-only" "GitLab only: Gamma" "$out"
+
+# Both-present repos default to "no push mirror" when no mirror fixture is set.
+# Beta/beta (casing differs) and dot.name (metacharacter name) must survive.
+assert_contains "no push mirror Beta" "no push mirror: Beta" "$out"
+assert_contains "no push mirror dot.name" "no push mirror: dot.name" "$out"
+assert_contains "no push mirror weird+name" "no push mirror: weird+name" "$out"
+
+# Both-present push-mirror status reporting. One fixture is served for every
+# project, so each repo is classified by the target its own name selects:
+#   dot.name  -> enabled/healthy to .../u/dot.name.git  => silent
+#   weird+name-> disabled mirror                        => "push mirror disabled"
+#   Beta      -> enabled but last_error, to .../u/beta.git (case-insensitive)
+#                                                       => "push mirror error"
+out=$(FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_audit.ndjson" \
+      sh "$ROOT/mirror.sh" audit --dry-run 2>&1); rc=$?
+assert_eq "audit rc with mirrors" 0 "$rc"
+assert_contains "disabled mirror reported" "push mirror disabled: weird+name" "$out"
+assert_contains "erroring mirror reported" "push mirror error: Beta" "$out"
+assert_not_contains "healthy dot.name silent (literal match)" "no push mirror: dot.name" "$out"
+assert_not_contains "healthy dot.name not disabled" "push mirror disabled: dot.name" "$out"
+assert_not_contains "healthy dot.name not error" "push mirror error: dot.name" "$out"
+assert_not_contains "case-insensitive Beta not missing" "no push mirror: Beta" "$out"
 
 # Direct interface checks: list_* fields and repo_key lowercasing.
 source_mirror "$ROOT"

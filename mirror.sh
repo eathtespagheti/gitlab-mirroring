@@ -171,6 +171,50 @@ resolve_config() {
 # repo_key <name>: lowercase key used for case-insensitive host matching.
 repo_key() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
+# mirror_list <project_id>: print one line per push mirror configured on the
+# GitLab project as id<TAB>url<TAB>enabled<TAB>last_error. GitLab returns
+# compact NDJSON; fields are extracted with awk (no jq, POSIX only). The
+# credentials in url are scrubbed by GitLab to https://*****:*****@host/..., so
+# only the host/path fragment is ever used. Missing fields stay empty.
+mirror_list() {
+  glab api "projects/$1/remote_mirrors" --output ndjson 2>/dev/null |
+    awk '
+      {
+        id = ""; url = ""; en = ""; err = ""
+        if (match($0, /"id":[0-9]+/))                 id  = substr($0, RSTART + 5,  RLENGTH - 5)
+        if (match($0, /"url":"[^"]*"/))               url = substr($0, RSTART + 7,  RLENGTH - 8)
+        if (match($0, /"enabled":(true|false)/))      en  = substr($0, RSTART + 10, RLENGTH - 10)
+        if (match($0, /"last_error":("[^"]*"|null)/)) err = substr($0, RSTART + 13, RLENGTH - 13)
+        if (id != "") printf "%s\t%s\t%s\t%s\n", id, url, en, err
+      }
+    '
+}
+
+# mirror_status <project_id> <gh_name>: print ok|disabled|error|missing for the
+# push mirror that targets github.com/$GH_USER/<gh_name>.git. The target is
+# matched literally with awk index() (repo names may contain sed/glob
+# metacharacters like . + [ *), never with a regex, and case-insensitively
+# (GitLab project MyApp may mirror to GitHub myapp). When several mirrors match,
+# the healthiest wins: ok > error > disabled.
+mirror_status() {
+  target="github.com/$GH_USER/$2.git"
+  mirror_list "$1" | awk -F'\t' -v t="$target" '
+    BEGIN { t = tolower(t); best = 0 }
+    index(tolower($2), t) {
+      if ($3 == "true" && ($4 == "null" || $4 == "")) r = 3
+      else if ($4 != "null" && $4 != "") r = 2
+      else r = 1
+      if (r > best) best = r
+    }
+    END {
+      if (best == 3) print "ok"
+      else if (best == 2) print "error"
+      else if (best == 1) print "disabled"
+      else print "missing"
+    }
+  '
+}
+
 # list_gitlab_projects: one line per project in the user namespace:
 #   gl_name<TAB>project_id<TAB>visibility<TAB>default_branch
 list_gitlab_projects() {
@@ -217,6 +261,19 @@ cmd_audit() {
       info "GitHub only: $name"
     fi
   done < "$gh_file"
+
+  # Both-present repos: report push-mirror health. Read-only; one API call per
+  # project. mirror_status matches the target literally and case-insensitively.
+  while IFS="$(printf '\t')" read -r name id _ _; do
+    [ -n "$name" ] || continue
+    key=$(repo_key "$name")
+    grep -qxF -- "$key" "$gh_keys" || continue
+    case "$(mirror_status "$id" "$(map_github_name "$name")")" in
+      missing)  info "no push mirror: $name" ;;
+      disabled) info "push mirror disabled: $name" ;;
+      error)    info "push mirror error: $name" ;;
+    esac
+  done < "$gl_file"
 }
 
 cmd_setup() { die "setup not implemented"; }
