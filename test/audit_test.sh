@@ -151,6 +151,10 @@ printf 'Blank\tprivate\n' > "$egh"
 out=$(FAKE_GLAB_PROJECTS="$egl" FAKE_GH_REPOS="$egh" FAKE_GLAB_API_OUT=/dev/null \
       sh "$ROOT/mirror.sh" audit --dry-run 2>&1)
 assert_contains "empty repo reported" "empty: Blank" "$out"
+# An empty repo is reported/skipped, not drift: it alone must not trip --exit-code.
+FAKE_GLAB_PROJECTS="$egl" FAKE_GH_REPOS="$egh" FAKE_GLAB_API_OUT=/dev/null \
+  sh "$ROOT/mirror.sh" audit --exit-code >/dev/null 2>&1
+assert_eq "exit-code ignores empty-only findings" 0 "$?"
 
 # Direct interface checks: list_* fields and repo_key lowercasing.
 source_mirror "$ROOT"

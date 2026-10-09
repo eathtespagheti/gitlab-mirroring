@@ -475,11 +475,12 @@ cmd_audit() {
       "$(awk 'END { print NR }' "$f_empty")" >&2
   fi
 
-  # --exit-code: non-zero when any category is non-empty.
+  # --exit-code: non-zero when any drift category is non-empty. Empty repos are
+  # reported/skipped, not drift, so they never trigger the exit code.
   if [ "$EXIT_CODE" = "1" ]; then
     for _ac_f in "$f_gitlab_only" "$f_github_only" "$f_no_mirror" \
                  "$f_disabled" "$f_error" "$f_dupes" "$f_vis" \
-                 "$f_div" "$f_empty"; do
+                 "$f_div"; do
       if [ -s "$_ac_f" ]; then
         return 1
       fi

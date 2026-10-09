@@ -155,12 +155,13 @@ second concurrent run exits with `sync already running`.
 | `--force-align` | `sync` | One-time force **GitLab → GitHub** for refs of divergent repos. |
 | `--conflict=MODE` | `sync` | Conflict policy: `lab` (default, GitLab wins) or `report` (warn only). |
 | `--json` | `audit` | Emit one machine-readable JSON object summarising every audit bucket. |
-| `--exit-code` | `audit` | Exit non-zero when any audit bucket is non-empty (default `audit` still exits `0`). |
-| `--verbose`, `-v` | all | Print per-bucket audit counts to stderr (no effect on stdout). |
+| `--exit-code` | `audit` | Exit non-zero when any drift bucket (not the `empty` bucket) is non-empty (default `audit` still exits `0`). |
+| `--verbose`, `-v` | `audit` | Print per-bucket audit counts to stderr (no effect on stdout). |
 | `--help`, `-h` | — | Show usage. |
 
 Exit codes: `0` on success. `audit` reports drift but exits `0` unless
-`--exit-code` is given, in which case it exits `1` when any bucket is non-empty.
+`--exit-code` is given, in which case it exits `1` when any drift bucket is
+non-empty (an empty repo alone does not trigger it).
 `setup`/`sync` exit non-zero if any intended action failed (per-repo failures are
 reported and do not abort the rest of the run). An unknown command exits `2`.
 
@@ -258,12 +259,11 @@ systemctl --user list-timers mirror-sync.timer
 - **Repo names are matched case-insensitively** and are assumed equal unless a
   `MIRROR_MAP` entry says otherwise.
 - **Push mirrors:** GitLab allows up to 10 per project. The tool manages exactly
-  one (to `github.com/<user>/<name>.git`); pre-existing extra mirrors are reported
-  but never deleted, and the tool will not create a duplicate.
+  one (to `$MIRROR_GITHUB_URL_BASE/<user>/<name>.git`, which defaults to
+  `https://$MIRROR_GITHUB_HOST/<user>/<name>.git`); pre-existing extra mirrors are
+  reported but never deleted, and the tool will not create a duplicate.
 - **API/network failures** are reported per repo and do not abort the run; the
   run exits non-zero if any repo failed.
-- `--json`, `--exit-code`, and `--verbose` are accepted by the parser but are not
-  yet wired into the output in this version.
 
 ## Tests
 
