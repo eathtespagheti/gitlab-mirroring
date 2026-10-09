@@ -245,7 +245,7 @@ git commit -m "feat: add POSIX sh skeleton, dispatch, and test harness"
 **Interfaces:**
 - Consumes: `parse_args`, globals from Task 1.
 - Produces:
-  - `resolve_config()` → sets `GH_USER`, `GL_USER`, `GH_TOKEN`, `CACHE_DIR`, `GITHUB_URL_BASE`, `GITLAB_URL_BASE`.
+  - `resolve_config()` → sets `GH_USER`, `GL_USER`, `GH_TOKEN`, `CACHE_DIR`, `GITHUB_URL_BASE`, `GITLAB_URL_BASE`, `GIT` (default `git`).
   - `map_github_name <gl_name>` → prints GitHub repo name (applies `MIRROR_MAP`).
   - `gl_to_gh_visibility <public|internal|private>` → `public|private`.
   - `gh_to_gl_visibility <PUBLIC|PRIVATE|INTERNAL>` → `public|private|internal`.
@@ -284,8 +284,9 @@ assert_eq "conflict report" report "$CONFLICT"
 parse_args sync -y
 assert_eq "yes" 1 "$ASSUME_YES"
 
-# Missing token must fail before mutation
-out=$(env -u GITHUB_TOKEN PATH="$ROOT/test/fakes-nogh:$PATH" \
+# Missing token must fail before mutation. Simulate by unsetting GITHUB_TOKEN and
+# making the fake `gh auth token` return nothing (exit 1).
+out=$(env -u GITHUB_TOKEN FAKE_GH_TOKEN_EMPTY=1 PATH="$ROOT/test/fakes:$PATH" \
       MIRROR_NO_MAIN=0 MIRROR_GITHUB_USER=u MIRROR_GITLAB_USER=u \
       sh "$ROOT/mirror.sh" audit --dry-run 2>&1); rc=$?
 assert_eq "missing token rc" 1 "$rc"
@@ -294,7 +295,7 @@ assert_contains "missing token msg" "GitHub token" "$out"
 report
 ```
 
-(Where `test/fakes-nogh` is a directory containing only the `glab` fake, so `gh` is absent — create it in this task; or simulate by setting `PATH` to a dir with only `glab`.)
+`test/fakes/gh` must implement `auth token`: when `FAKE_GH_TOKEN_EMPTY=1`, print nothing and exit 1; otherwise print `${FAKE_GH_TOKEN:-ghp_fake}`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -331,6 +332,9 @@ Test fakes:
 printf 'gh %s\n' "$*" >> "$FAKE_CALLS_LOG"
 case "$1 $2" in
   "api user") printf '%s\n' "${FAKE_GH_USER:-tester}" ;;
+  "auth token")
+    if [ "${FAKE_GH_TOKEN_EMPTY:-0}" = "1" ]; then exit 1; fi
+    printf '%s\n' "${FAKE_GH_TOKEN:-ghp_fake}" ;;
   "repo list") cat "${FAKE_GH_REPOS:-/dev/null}" ;;
   "repo view")
     if [ -n "${FAKE_GH_EXISTING:-}" ] && grep -qxF "$3" "$FAKE_GH_EXISTING"; then exit 0; fi
@@ -609,7 +613,7 @@ git commit -m "feat: parse and report GitLab push mirror status in audit"
 
 **Interfaces:**
 - Consumes: `list_gitlab_projects`, `list_github_repos`, `mirror_status`, `map_github_name`, visibility mappers.
-- Produces: `plan_setup` → prints one action line per repo (no side effects): `create-github<TAB>name<TAB>visibility`, `create-gitlab<TAB>name<TAB>visibility`, `seed-gitlab<TAB>name`, `configure-mirror<TAB>name<TAB>project_id`, `skip<TAB>name<TAB>reason`, `align<TAB>name`. `cmd_setup` prints these and, when `DRY_RUN=1`, stops.
+- Produces: `plan_setup` → prints one **space-separated** action line per repo (no side effects): `create-github <name> <visibility>`, `create-gitlab <name> <visibility>`, `seed-gitlab <name>`, `configure-mirror <name> <project_id>`, `skip <name> <reason>`, `align <name>`. Repo names contain no spaces, so spaces are a safe separator. `cmd_setup` prints these and, when `DRY_RUN=1`, stops.
 
 - [ ] **Step 1: Write the failing test** (`test/setup_test.sh`)
 
@@ -633,11 +637,13 @@ FAKE_GLAB_PROJECTS="$ROOT/test/fixtures/gl_projects2.tsv"; export FAKE_GLAB_PROJ
 FAKE_GLAB_API_OUT="$ROOT/test/fixtures/mirrors_alpha.ndjson"; export FAKE_GLAB_API_OUT
 
 out=$(sh "$ROOT/mirror.sh" setup --dry-run 2>&1)
-assert_contains "create github Alpha? no (mirror ok)" "" "$out"
-assert_contains "create github for Gamma on GitLab" "create-gitlab	Gamma	private" "$out"
-assert_contains "seed Gamma" "seed-gitlab	Gamma" "$out"
-assert_contains "configure mirror Empty" "configure-mirror	Empty	12" "$out"
+# Plan lines are space-separated (repo names contain no spaces).
+assert_contains "GitLab-only Gamma is created" "create-gitlab Gamma private" "$out"
+assert_contains "Gamma is seeded" "seed-gitlab Gamma" "$out"
+assert_contains "Empty gets a mirror configured" "configure-mirror Empty 12" "$out"
 assert_contains "empty repo handled" "Empty" "$out"
+# Alpha already has a healthy mirror -> no configure line for it
+case "$out" in *"configure-mirror Alpha"*) assert_eq "Alpha mirror untouched" "absent" "present" ;; esac
 # dry-run must not mutate
 calls=$(cat "$FAKE_CALLS_LOG")
 case "$calls" in *"repo create"*) assert_eq "no mutation in dry-run" "no create" "created" ;; esac
@@ -700,14 +706,15 @@ git commit -m "feat: setup plan generation (dry-run) with empty-repo handling"
 
 ```sh
 # apply
-: > "$FAKE_CALLS_LOG"
+export GIT="$ROOT/test/fakes/git"
+: > "$FAKE_CALLS_LOG"; : > "$ROOT/test/fixtures/git.log"; : > "$ROOT/test/fixtures/body.log"
 sh "$ROOT/mirror.sh" setup --yes >/dev/null 2>&1
 calls=$(cat "$FAKE_CALLS_LOG")
 assert_contains "created GitLab project Gamma" "glab repo create Gamma" "$calls"
-assert_contains "seeded from github" "git clone" "$(cat "$ROOT/test/fixtures/git.log")"
-assert_contains "configured mirror Alpha" "glab api -X POST projects/12/remote_mirrors" "$calls"
+assert_contains "seeded from github" "clone" "$(cat "$ROOT/test/fixtures/git.log")"
+assert_contains "configured mirror Empty" "glab api -X POST projects/12/remote_mirrors" "$calls"
 body=$(cat "$ROOT/test/fixtures/body.log")
-assert_contains "mirror url" "https://github.com/u/Empty.git" "$body"
+assert_contains "mirror url" "github.com/u/Empty.git" "$body"
 assert_contains "keep divergent" '"keep_divergent_refs":true' "$body"
 assert_contains "enabled" '"enabled":true' "$body"
 
@@ -716,8 +723,8 @@ report
 
 Extend the fakes:
 - `test/fakes/gh`: log to `$FAKE_CALLS_LOG`; `repo create` prints a URL.
-- `test/fakes/glab`: handle `repo create`; for `api projects/<id>/remote_mirrors` with `-X POST`, read `--input` file and append its contents to `$FAKE_BODY_LOG`, print `{}`; for GET print `$FAKE_GLAB_API_OUT`.
-- A `test/fakes/git` shim is **not** used; `seed_gitlab_from_github` is tested by pointing `MIRROR_GITHUB_URL_BASE`/`MIRROR_GITLAB_URL_BASE` at local bare repos and running real `git` (see Task 7 for the pattern). For the setup test, assert the intended `git` command via `run`'s printed plan by setting `DRY_RUN`… Instead, make `seed` call `run` and capture via a `GIT` wrapper: set `GIT` env (default `git`) so tests can substitute a logger. Document `$GIT` in `resolve_config`.
+- `test/fakes/glab`: handle `repo create`; for `api projects/<id>/remote_mirrors` with `-X POST`, read the `--input` file (find the argument after `--input`) and append its contents to `$FAKE_BODY_LOG`, print `{}`; for GET print `$FAKE_GLAB_API_OUT`.
+- `test/fakes/git`: append its arguments to `$FAKE_GIT_LOG` and exit 0. Tests point `GIT` at it to observe seeding without real network. `seed_gitlab_from_github` uses `run "$GIT" ...`, and `run` masks credentials in its printed form.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -762,9 +769,9 @@ cat > "$tmp" <<EOF
 EOF
 run glab api -X POST "projects/$1/remote_mirrors" --input "$tmp"
 ```
-If `mirror_status "$1" "$2"` is already `ok`, skip (idempotency). If `disabled`/`error`, update the existing mirror id instead of creating a duplicate:
+If `mirror_status "$1" "$2"` is already `ok`, skip (idempotency). If `disabled`/`error`, look up the existing mirror id from `mirror_list "$1"` (the line whose `url` contains `github.com/$GH_USER/$2.git`) and update it instead of creating a duplicate:
 ```sh
-# update path
+mid=$(mirror_list "$1" | awk -F'\t' -v t="github.com/$GH_USER/$2.git" 'index($2,t){print $1; exit}')
 run glab api -X PUT "projects/$1/remote_mirrors/$mid" --input "$tmp"
 ```
 
@@ -807,32 +814,39 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/test/helpers.sh"
 
 work=$(mktemp -d)
-git -c init.defaultBranch=main init --bare "$work/github.git" >/dev/null
-git -c init.defaultBranch=main init --bare "$work/gitlab.git" >/dev/null
+mkdir -p "$work/github/u" "$work/gitlab/u"
+git -c init.defaultBranch=main init --bare "$work/github/u/proj.git" >/dev/null
+git -c init.defaultBranch=main init --bare "$work/gitlab/u/proj.git" >/dev/null
 
 # seed github with a commit
 seed=$(mktemp -d)
-git -C "$seed" init -q -b main
+git -C "$seed" -c init.defaultBranch=main init -q
 git -C "$seed" -c user.email=a@b -c user.name=a commit -q --allow-empty -m one
-git -C "$seed" push -q "$work/github.git" main
+git -C "$seed" push -q "$work/github/u/proj.git" main
 
 export MIRROR_GITHUB_USER=u MIRROR_GITLAB_USER=u GITHUB_TOKEN=x
-export MIRROR_GITHUB_URL_BASE="file://$work/github.git"
-export MIRROR_GITLAB_URL_BASE="file://$work/gitlab.git"
+export MIRROR_GITHUB_URL_BASE="file://$work/github"
+export MIRROR_GITLAB_URL_BASE="file://$work/gitlab"
 export MIRROR_CACHE="$work/cache"
 export PATH="$ROOT/test/fakes:$PATH"
+# glab fake needs to report one project and a healthy mirror for config/audit calls
+printf 'proj\t1\tprivate\tmain\n' > "$work/gl.tsv"
+printf '{"id":9,"enabled":true,"url":"https://*****:*****@github.com/u/proj.git","last_error":null}\n' > "$work/mir.ndjson"
+export FAKE_GLAB_PROJECTS="$work/gl.tsv" FAKE_GLAB_API_OUT="$work/mir.ndjson"
 
 sh "$ROOT/mirror.sh" sync --yes --only proj >/dev/null 2>&1
 
-git -C "$work/gitlab.git" rev-parse --verify main >/dev/null 2>&1
+git -C "$work/gitlab/u/proj.git" rev-parse --verify main >/dev/null 2>&1
 assert_eq "github commit rescued into gitlab" 0 $?
 assert_eq "same commit" \
-  "$(git -C "$work/github.git" rev-parse main)" \
-  "$(git -C "$work/gitlab.git" rev-parse main)"
+  "$(git -C "$work/github/u/proj.git" rev-parse main)" \
+  "$(git -C "$work/gitlab/u/proj.git" rev-parse main)"
 
 rm -rf "$work" "$seed"
 report
 ```
+
+The script builds remote URLs as `$MIRROR_GITHUB_URL_BASE/$GH_USER/<name>.git`, so the fixture layout is `$work/github/u/proj.git` and `$work/gitlab/u/proj.git`.
 
 The fake `glab` for this test must make `repo list` return `proj` with id and `--only proj` restricts to it; set `FAKE_GLAB_PROJECTS` to a fixture `proj\t1\tprivate\tmain`, and `FAKE_GLAB_API_OUT` to a healthy mirror fixture so config/audit calls don't fail.
 
@@ -904,21 +918,49 @@ git commit -m "feat: sync fast-forwards GitHub-side commits into GitLab"
 - [ ] **Step 1: Write the failing test** (extend `test/sync_test.sh`)
 
 ```sh
-# Build divergence: github has commit G, gitlab has commit L on the same branch.
-# ... create both bare repos with divergent commits ...
-sh "$ROOT/mirror.sh" sync --yes --only proj --conflict=report >/dev/null 2>&1
-assert_eq "report leaves gitlab alone" "$L" "$(git -C "$work/gitlab.git" rev-parse main)"
-out=$(sh "$ROOT/mirror.sh" sync --yes --only proj 2>&1)   # default lab
-assert_contains "gitlab wins on conflict" "conflict" "$out"
-assert_eq "github forced to gitlab" "$L" "$(git -C "$work/github.git" rev-parse main)"
+# Build a divergence in a fresh pair of bare repos:
+#   common -> gitlab gets commit L, github gets commit G
+w2=$(mktemp -d); mkdir -p "$w2/github/u" "$w2/gitlab/u"
+git -c init.defaultBranch=main init --bare "$w2/github/u/proj.git" >/dev/null
+git -c init.defaultBranch=main init --bare "$w2/gitlab/u/proj.git" >/dev/null
 
-# lock: second concurrent run refuses
+s=$(mktemp -d); git -C "$s" -c init.defaultBranch=main init -q
+git -C "$s" -c user.email=a@b -c user.name=a commit -q --allow-empty -m base
+git -C "$s" push -q "$w2/github/u/proj.git" main
+git -C "$s" push -q "$w2/gitlab/u/proj.git" main
+# gitlab side commit L
+git -C "$s" -c user.email=a@b -c user.name=a commit -q --allow-empty -m L
+git -C "$s" push -q "$w2/gitlab/u/proj.git" main
+L=$(git -C "$w2/gitlab/u/proj.git" rev-parse main)
+# github side commit G (from the common base)
+git -C "$s" -c user.email=a@b -c user.name=a reset -q --hard HEAD~1
+git -C "$s" -c user.email=a@b -c user.name=a commit -q --allow-empty -m G
+git -C "$s" push -q --force "$w2/github/u/proj.git" main
+G=$(git -C "$w2/github/u/proj.git" rev-parse main)
+
+export MIRROR_GITHUB_URL_BASE="file://$w2/github" MIRROR_GITLAB_URL_BASE="file://$w2/gitlab"
+export MIRROR_CACHE="$w2/cache"
+export GITHUB_TOKEN=x MIRROR_GITHUB_USER=u MIRROR_GITLAB_USER=u
+printf 'proj\t1\tprivate\tmain\n' > "$w2/gl.tsv"
+printf '{"id":9,"enabled":true,"url":"https://*****:*****@github.com/u/proj.git","last_error":null}\n' > "$w2/mir.ndjson"
+export FAKE_GLAB_PROJECTS="$w2/gl.tsv" FAKE_GLAB_API_OUT="$w2/mir.ndjson"
+
+sh "$ROOT/mirror.sh" sync --yes --only proj --conflict=report >/dev/null 2>&1
+assert_eq "report leaves gitlab alone"   "$L" "$(git -C "$w2/gitlab/u/proj.git" rev-parse main)"
+assert_eq "report leaves github alone"   "$G" "$(git -C "$w2/github/u/proj.git" rev-parse main)"
+out=$(sh "$ROOT/mirror.sh" sync --yes --only proj 2>&1)   # default: lab wins
+assert_contains "gitlab wins on conflict" "conflict" "$out"
+assert_eq "github forced to gitlab"      "$L" "$(git -C "$w2/github/u/proj.git" rev-parse main)"
+
+# lock: a pre-existing lock makes sync refuse
+rm -rf "$MIRROR_CACHE"
 mkdir -p "$MIRROR_CACHE/.sync.lock"
 out=$(sh "$ROOT/mirror.sh" sync --yes 2>&1); rc=$?
 assert_eq "locked rc" 1 "$rc"
 assert_contains "locked msg" "already running" "$out"
 rmdir "$MIRROR_CACHE/.sync.lock"
 
+rm -rf "$w2" "$s"
 report
 ```
 
@@ -1025,7 +1067,7 @@ git commit -m "docs: add README, cron/systemd examples; final checks"
 
 **2. Step scan** — each step yields one action with a checkable result; code bodies appear only where the algorithm is not implied by signature + test (the `sed`/`awk` parsers, the ancestry decision).
 
-**3. Type consistency** — function names used across tasks match their Task definitions (`map_github_name`, `mirror_status`, `mirror_list`, `plan_setup`, `ensure_push_mirror`, `cache_repo_dir`, `handle_conflict`, `acquire_lock`/`release_lock`). Data shapes: project TSV `name<TAB>id<TAB>visibility<TAB>branch`; mirror TSV `id<TAB>url<TAB>enabled<TAB>last_error`; plan TSV `action<TAB>args...`.
+**3. Type consistency** — function names used across tasks match their Task definitions (`map_github_name`, `mirror_status`, `mirror_list`, `plan_setup`, `ensure_push_mirror`, `cache_repo_dir`, `handle_conflict`, `acquire_lock`/`release_lock`). Data shapes: project TSV `name<TAB>id<TAB>visibility<TAB>branch`; mirror TSV `id<TAB>url<TAB>enabled<TAB>last_error`; plan lines `action arg...` (space-separated).
 
 **4. Review Focus** — each of the six items has a test in its owning task (Tasks 2,3,4,5,6,8).
 
