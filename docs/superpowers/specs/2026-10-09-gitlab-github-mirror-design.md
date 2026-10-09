@@ -74,6 +74,12 @@ mirrored going forward, built on the `gh` and `glab` CLIs.
 - **External tools required:** `sh`, `git`, `gh`, `glab`. On PATH.
 - **Auth:** `gh` and `glab` must already be logged in. A GitHub token for the
   mirror URL is taken from `$GITHUB_TOKEN` or `gh auth token`.
+- **Git-level auth for `sync`:** the tool does not manage GitLab tokens. `git`
+  fetch/push uses the user's existing Git configuration — either SSH keys or a
+  credential helper (e.g. `glab`'s git credential helper). Remotes are built
+  from the standard HTTPS/SSH clone URL; a `MIRROR_GITLAB_HOST` /
+  `MIRROR_GITHUB_HOST` override supports self-hosted GitLab or GitHub
+  Enterprise.
 
 ## 5. Design overview
 
@@ -116,13 +122,16 @@ Common options:
 - `--exclude <name>` — skip a repo (repeatable).
 - `--force-align` — for divergent pairs, one-time force GitLab → GitHub.
 - `--conflict=<lab|report>` — conflict policy for `sync` (default `lab`).
+- `--json` — machine-readable output for `audit`.
+- `--exit-code` — make `audit` exit non-zero when drift is found.
 - `--verbose` — extra diagnostics to stderr.
 
 Default behavior: `setup` and `sync` compute a plan and, without `--yes`, prompt
 for confirmation before mutating.
 
-Exit codes: `0` success/no drift, non-zero on error. `audit` exits `0` even when
-drift is found (drift is reported, not an error), unless `--exit-code` is given.
+Exit codes: `0` on success. `audit` returns `0` even when drift is found
+(drift is reported, not an error) unless `--exit-code` is set. Any per-repo
+failure that prevented an intended action makes the run exit non-zero.
 
 ## 7. Configuration and authentication
 
@@ -134,9 +143,15 @@ drift is found (drift is reported, not an error), unless `--exit-code` is given.
 | GitLab auth | delegated to `glab` (already logged in) |
 | Cache dir | `$MIRROR_CACHE`, else `${XDG_CACHE_HOME:-$HOME/.cache}/gitlab-github-mirror` |
 | Name/visibility overrides | `$MIRROR_MAP` file (optional) |
+| Hosts | `$MIRROR_GITHUB_HOST` (default `github.com`), `$MIRROR_GITLAB_HOST` |
 
 Secrets are never echoed. The GitHub token appears only inside the mirror URL
 sent to GitLab (which stores it encrypted and scrubs it from API responses).
+
+`MIRROR_MAP` is a plain-text file, one repo per line, with whitespace-separated
+fields: `<gitlab-name> <github-name> [visibility]`, where `visibility` is
+`public` or `private`. Blank lines and `#` comments are ignored. It overrides
+the default same-name/case-insensitive mapping.
 
 ## 8. `audit`
 
@@ -153,6 +168,10 @@ sent to GitLab (which stores it encrypted and scrubs it from API responses).
    - **Divergent histories** → reported (needs `--force-align` or manual fix).
    - **Empty repos** (no commits) → reported/skipped.
 4. Output is human-readable; `--json` emits a machine-readable summary.
+
+`audit` never mutates a remote. To detect divergent histories it may read
+through (and therefore populate) the local cache, but it performs no remote
+writes.
 
 ## 9. `setup` (idempotent; never deletes)
 
@@ -172,17 +191,19 @@ For each repo, after `audit`:
    - Configure the push mirror (§10).
 3. **Both**
    - Ensure the push mirror exists and is healthy (§10).
-   - If histories are divergent: report; with `--force-align`, force GitLab →
-     GitHub once to establish GitLab as truth, then leave the steady-state
-     mirror in place.
+   - If histories are divergent: report; with `--force-align`, force-update
+     matching GitHub refs to GitLab's refs once (`git push --force` per ref,
+     never `--mirror`), so no GitHub refs are deleted. Afterwards the
+     steady-state mirror is left in place.
 
 All creations preserve visibility. Every action is printed as a plan first and
 requires `--yes` (or interactive confirmation) to run. Re-running is a no-op
 when nothing changed.
 
 Mirror-specific edge: GitLab allows up to 10 push mirrors per project. The tool
-manages exactly one mirror targeting `github.com/<gh-user>/<name>.git` and
-ignores/removes duplicates it created only when explicitly requested.
+manages exactly one mirror targeting `github.com/<gh-user>/<name>.git`. If other
+mirrors already exist they are reported, never auto-deleted; the tool declines to
+add a duplicate.
 
 ## 10. Push mirror configuration (GitLab → GitHub)
 
@@ -217,7 +238,9 @@ must not) overwrite.
 Per managed repo, using a bare cache at `$MIRROR_CACHE/<name>.git`:
 
 1. Initialise the cache if absent (`git init --bare`, add `github` and `gitlab`
-   remotes using token URLs).
+   remotes). Remote URLs use the standard clone URL for each host; `git`'s
+   authentication (SSH keys or a credential helper) is inherited from the user's
+   environment. The tool never stores or echoes a GitLab token.
 2. Fetch both sides with prune:
    `+refs/heads/*:refs/remotes/github/*`, same for `gitlab`, and tags.
 3. For each GitHub branch `b`:
