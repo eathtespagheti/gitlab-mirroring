@@ -1052,13 +1052,70 @@ git commit -m "docs: add README, cron/systemd examples; final checks"
 
 ---
 
+### Task 10: Audit completeness and host-correct mirror URLs
+
+Added after Task 9 to close spec gaps found when auditing coverage against the design (§6 flags, §8 audit buckets, §7 host override). Rationale: the spec is the binding authority.
+
+**Files:**
+- Modify: `mirror.sh`, `test/audit_test.sh`, `test/mirror_test.sh`, `test/setup_test.sh`, `README.md`
+
+**Interfaces:**
+- Consumes: `list_gitlab_projects`, `list_github_repos`, `mirror_status`, `mirror_list`, `cache_ensure`, `GITHUB_HOST`.
+- Produces:
+  - `audit_findings()` → writes the drift report; populates arrays/lists used for `--json` and `--exit-code`.
+  - `cmd_audit` honors `EXIT_CODE` (exit non-zero when any drift category is non-empty) and `JSON_OUT` (emit one JSON object summary to stdout).
+  - `GITHUB_URL_FOR_MIRROR`/target fragment uses `$GITHUB_HOST` (not a hard-coded `github.com`).
+
+- [ ] **Step 1: Write the failing tests**
+
+In `test/audit_test.sh` add:
+```sh
+# --exit-code: drift present -> non-zero; clean -> 0
+sh "$ROOT/mirror.sh" audit --exit-code >/dev/null 2>&1
+[ $? -ne 0 ] || assert_eq "exit-code with drift" "non-zero" "0"
+# --json: one object containing the bucket keys
+json=$(sh "$ROOT/mirror.sh" audit --json 2>/dev/null)
+assert_contains "json has gitlab_only" '"gitlab_only"' "$json"
+assert_contains "json has divergent"   '"divergent"'   "$json"
+# visibility mismatch: GitLab public vs GitHub private for the same repo
+assert_contains "visibility mismatch reported" "visibility mismatch" "$out"
+```
+In `test/mirror_test.sh` or `test/setup_test.sh` add: with `MIRROR_GITHUB_HOST=github.example.com`, the constructed mirror URL/target contains `@github.example.com/` and not `@github.com/`.
+
+In `test/sync_test.sh` (or a new small test) add: a both-present repo whose `main` diverges is reported by `audit` as `divergent` (build local bare repos as in Task 8).
+
+- [ ] **Step 2: Run tests to verify they fail** — `sh test/run.sh`; expected: new assertions fail.
+
+- [ ] **Step 3: Implement**
+
+- `cmd_audit`: while iterating both-present repos, also compare GitLab `visibility` with GitHub visibility; on mismatch print `visibility mismatch: <name> (<gitlab> vs <github>)`.
+- Divergence: for each both-present repo, `cache_ensure` + fetch (read-only), then for each branch use `git merge-base --is-ancestor` both ways; if neither is an ancestor print `divergent: <name>`. Reuse the Task 7 cache helpers; do not write to remotes.
+- `--json`: collect each category into a newline-separated list, then print one JSON object:
+  `{"gitlab_only":[...],"github_only":[...],"no_mirror":[...],"mirror_disabled":[...],"mirror_error":[...],"duplicate_mirrors":[...],"visibility_mismatch":[...],"divergent":[...],"empty":[...]}`. Repo names match `[A-Za-z0-9._-]`, so no JSON escaping is required; still, skip any name containing a double quote defensively.
+- `--exit-code`: after building findings, `if [ "$EXIT_CODE" = 1 ] && any category non-empty; then return 1`.
+- `--verbose`: print counts per category to stderr.
+- Replace hard-coded `github.com` in `ensure_push_mirror`'s URL and in `mirror_list`/`mirror_status`'s target fragment with `$GITHUB_HOST`.
+- Update `README.md`: document `--json`/`--exit-code`/`--verbose` as implemented, add `--help` to the options table, note `MIRROR_MAP`'s third field is ignored, clarify `sync --dry-run` still creates local cache/lock, and state that audit now reports visibility mismatches and divergence.
+
+- [ ] **Step 4: Run tests to verify they pass** — `sh test/run.sh && sh test/check.sh`; tree clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add mirror.sh test/ README.md
+git commit -m "feat: audit --json/--exit-code/verbose, visibility+divergence buckets, host-correct mirror URLs"
+```
+
+---
+
 ## Self-Review
 
 **1. Spec coverage**
 - Problem/research/choice of GitLab hub → Tasks 3–8 realize it; README (Task 9) documents caveats.
 - Goals: audit (3,4), reconcile/create (5,6), push mirror (6), safety net (7), safe/idempotent (6,8), portability (1,9).
 - Non-goals respected: no issues/MRs/wikis, personal namespaces only, no daemon.
-- Config/auth table → Task 2; `MIRROR_MAP` format → Task 2; host/URL bases → Task 2.
+- Spec §6 flags `--json`/`--exit-code`/`--verbose` and §8 visibility-mismatch/divergence buckets → added as Task 10 (post-hoc coverage fix).
+- Config/auth table → Task 2; `MIRROR_MAP` format → Task 2; host/URL bases → Task 2, host used in mirror URLs → Task 10.
 - CLI/flags/exit codes → Tasks 1,2; `--force-align`/`--conflict` → Task 8.
 - Push mirror exact params → Task 6.
 - Sync policy and why → Task 7,8.
