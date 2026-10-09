@@ -311,7 +311,84 @@ cmd_audit() {
   done < "$gl_file"
 }
 
-cmd_setup() { die "setup not implemented"; }
+# plan_setup: print the reconcile plan, one space-separated action per line
+# (ruling 2; repo names contain no spaces):
+#   create-github <gh_name> <visibility>
+#   configure-mirror <name> <project_id>
+#   create-gitlab <name> <visibility>
+#   seed-gitlab <name>
+# Pure: read-only API calls only, no mutations. An empty GitLab project (blank
+# default_branch) still gets a mirror configured and is never an error.
+plan_setup() {
+  [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
+  mkdir -p "$WORK_DIR" || die "cannot create work dir"
+  pgl_file=$WORK_DIR/setup.gl.tsv
+  pgh_file=$WORK_DIR/setup.gh.tsv
+  pgl_keys=$WORK_DIR/setup.gl.keys
+  pgh_keys=$WORK_DIR/setup.gh.keys
+  pmapped_keys=$WORK_DIR/setup.mapped.keys
+
+  list_gitlab_projects > "$pgl_file" || die "failed to list GitLab projects"
+  list_github_repos > "$pgh_file" || die "failed to list GitHub repositories"
+
+  # Lowercased key sets; matching is literal (grep -F), never regex.
+  awk -F'\t' 'NF { print tolower($1) }' "$pgl_file" > "$pgl_keys"
+  awk -F'\t' 'NF { print tolower($1) }' "$pgh_file" > "$pgh_keys"
+  # Every GitHub name a GitLab project already maps onto, so a mapped pair is
+  # never misread as "GitHub only".
+  while IFS="$(printf '\t')" read -r name _ _ _; do
+    [ -n "$name" ] || continue
+    map_github_name "$name" | tr '[:upper:]' '[:lower:]'
+  done < "$pgl_file" > "$pmapped_keys"
+
+  # GitLab projects: create the GitHub counterpart when absent, otherwise
+  # ensure the push mirror is healthy.
+  while IFS="$(printf '\t')" read -r name id vis _branch; do
+    [ -n "$name" ] || continue
+    gh_name=$(map_github_name "$name")
+    if grep -qxF -- "$(repo_key "$gh_name")" "$pgh_keys"; then
+      st=$(mirror_status "$id" "$gh_name")
+      case "$st" in
+        missing | disabled | error) printf 'configure-mirror %s %s\n' "$name" "$id" ;;
+      esac
+    else
+      printf 'create-github %s %s\n' "$gh_name" "$(gl_to_gh_visibility "$vis")"
+      printf 'configure-mirror %s %s\n' "$name" "$id"
+    fi
+  done < "$pgl_file"
+
+  # GitHub-only repos: create on GitLab and seed once. A repo whose name (raw
+  # or mapped) already has a GitLab counterpart is not "GitHub only".
+  while IFS="$(printf '\t')" read -r name vis; do
+    [ -n "$name" ] || continue
+    key=$(repo_key "$name")
+    if grep -qxF -- "$key" "$pgl_keys" || grep -qxF -- "$key" "$pmapped_keys"; then
+      continue
+    fi
+    printf 'create-gitlab %s %s\n' "$name" "$(gh_to_gl_visibility "$vis")"
+    printf 'seed-gitlab %s\n' "$name"
+  done < "$pgh_file"
+}
+
+# cmd_setup: print the plan and, under --dry-run, stop without mutating. Apply
+# is Task 6; until then a non-dry run fails loudly rather than silently doing
+# nothing.
+cmd_setup() {
+  [ -n "${WORK_DIR:-}" ] || die "internal: WORK_DIR not set"
+  plan=$(plan_setup)
+  info "setup plan:"
+  if [ -n "$plan" ]; then
+    printf '%s\n' "$plan"
+  else
+    info "nothing to do"
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    info "dry run; no changes"
+    return 0
+  fi
+  die "setup apply not implemented"
+}
+
 cmd_sync()  { die "sync not implemented"; }
 
 main() {
