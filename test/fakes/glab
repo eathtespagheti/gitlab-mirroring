@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake `glab` for the test suite. Honors FAKE_* env vars and logs every call to
+# ${FAKE_CALLS_LOG:-/dev/null}. Never used outside test/.
+: "${FAKE_CALLS_LOG:=/dev/null}"
+printf 'glab %s\n' "$*" >> "$FAKE_CALLS_LOG"
+case "$1 $2" in
+  "api user")
+    if [ -n "${FAKE_GLAB_USER_JSON:-}" ]; then
+      printf '%s\n' "$FAKE_GLAB_USER_JSON"
+    else
+      printf '%s\n' '{"username":"tester"}'
+    fi ;;
+  "repo list") cat "${FAKE_GLAB_PROJECTS:-/dev/null}" ;;
+  "repo create") printf 'https://gitlab.com/%s\n' "$2" ;;
+  "api "*)
+    # Generic GET (endpoint in $2); Task 4 handles remote_mirrors specially.
+    cat "${FAKE_GLAB_API_OUT:-/dev/null}" ;;
+  *) printf 'fake-glab: unhandled: %s\n' "$*" >&2; exit 1 ;;
+esac

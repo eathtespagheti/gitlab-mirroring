@@ -1,0 +1,17 @@
+#!/bin/sh
+# Fake `gh` for the test suite. Honors FAKE_* env vars and logs every call to
+# ${FAKE_CALLS_LOG:-/dev/null}. Never used outside test/.
+: "${FAKE_CALLS_LOG:=/dev/null}"
+printf 'gh %s\n' "$*" >> "$FAKE_CALLS_LOG"
+case "$1 $2" in
+  "api user") printf '%s\n' "${FAKE_GH_USER:-tester}" ;;
+  "auth token")
+    if [ "${FAKE_GH_TOKEN_EMPTY:-0}" = "1" ]; then exit 1; fi
+    printf '%s\n' "${FAKE_GH_TOKEN:-ghp_fake}" ;;
+  "repo list") cat "${FAKE_GH_REPOS:-/dev/null}" ;;
+  "repo view")
+    if [ -n "${FAKE_GH_EXISTING:-}" ] && grep -qxF "$3" "$FAKE_GH_EXISTING"; then exit 0; fi
+    printf 'not found\n' >&2; exit 1 ;;
+  "repo create") printf 'https://github.com/%s\n' "$2" ;;
+  *) printf 'fake-gh: unhandled: %s\n' "$*" >&2; exit 1 ;;
+esac
