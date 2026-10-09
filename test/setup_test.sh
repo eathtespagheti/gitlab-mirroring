@@ -64,6 +64,10 @@ calls=$(cat "$FAKE_CALLS_LOG")
 assert_contains "created GitHub repo Empty" "gh repo create u/Empty --private" "$calls"
 assert_contains "created GitLab project Gamma" "glab repo create Gamma" "$calls"
 assert_contains "seeded from github" "clone" "$(cat "$FAKE_GIT_LOG")"
+# Seeding must push explicit refs, never `--mirror` (which can delete refs).
+assert_contains "seed pushes branches" "+refs/heads/*:refs/heads/*" "$(cat "$FAKE_GIT_LOG")"
+assert_contains "seed pushes tags" "+refs/tags/*:refs/tags/*" "$(cat "$FAKE_GIT_LOG")"
+assert_not_contains "seed does not use --mirror" "--mirror" "$(cat "$FAKE_GIT_LOG")"
 assert_contains "configured mirror Empty" "glab api -X POST projects/12/remote_mirrors" "$calls"
 body=$(cat "$FAKE_BODY_LOG")
 assert_contains "mirror url" "github.com/u/Empty.git" "$body"

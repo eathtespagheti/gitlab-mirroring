@@ -415,15 +415,18 @@ create_gitlab_project() {
   run glab repo create "$1" "$v" --skipGitInit
 }
 
-# seed_gitlab_from_github <name>: clone the GitHub repo bare, then push every ref
-# to the freshly created GitLab project. Both calls go through run, so they obey
-# DRY_RUN and are observable via $GIT in tests.
+# seed_gitlab_from_github <name>: clone the GitHub repo bare, then push every
+# branch and tag to the freshly created (empty) GitLab project. Explicit
+# refspecs are used instead of `--mirror` so seeding can only create/update refs
+# and can never delete them. Both calls go through run, so they obey DRY_RUN and
+# are observable via $GIT in tests.
 seed_gitlab_from_github() {
   d="$WORK_DIR/$1.git"
   seed_url="$GITHUB_URL_BASE/$GH_USER/$1.git"
   dest_url="$GITLAB_URL_BASE/$GL_USER/$1.git"
   run "$GIT" clone --bare --quiet "$seed_url" "$d"
-  run "$GIT" -C "$d" push --mirror "$dest_url"
+  run "$GIT" -C "$d" push --force "$dest_url" \
+    "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
 }
 
 # mirror_body_file <gh_name>: write the push-mirror JSON body to a 0600 file and
